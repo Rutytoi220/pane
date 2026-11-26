@@ -18,6 +18,7 @@ macro_rules! log {
 mod files;
 mod outbox;
 mod processes;
+mod services;
 mod sysinfo;
 mod telemetry;
 mod terminal;
@@ -130,6 +131,13 @@ fn main() {
                 };
                 outbox.send(reply);
             }
+            ClientMsg::WriteTextFile { req_id, path, content } => {
+                let reply = match files::write_text_file(&path, &content) {
+                    Ok(saved_path) => HostMsg::WriteFileResult { req_id, path: saved_path, ok: true, error: None },
+                    Err(err) => HostMsg::WriteFileResult { req_id, path, ok: false, error: Some(err) },
+                };
+                outbox.send(reply);
+            }
             ClientMsg::ListProcesses { req_id } => {
                 let processes = proc_mon.snapshot();
                 outbox.send(HostMsg::ProcessList { req_id, processes });
@@ -141,6 +149,13 @@ fn main() {
                 }
                 Err(message) => outbox.send(HostMsg::Error { req_id: Some(req_id), message }),
             },
+            ClientMsg::ListServices { req_id } => services::spawn_list(req_id, outbox.clone()),
+            ClientMsg::ControlService { req_id, name, action } => {
+                services::spawn_control_service(req_id, name, action, outbox.clone());
+            }
+            ClientMsg::ControlContainer { req_id, id, action } => {
+                services::spawn_control_container(req_id, id, action, outbox.clone());
+            }
         }
     }
 

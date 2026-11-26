@@ -52,6 +52,13 @@ fn end_to_end_stdio_session() {
     write_frame(&mut stdin, &ClientMsg::ReadTextFile { req_id: 3, path: sample_file.to_string_lossy().into() })
         .unwrap();
     write_frame(&mut stdin, &ClientMsg::ListProcesses { req_id: 4 }).unwrap();
+    let edited_file = tmp.join("edited.yml");
+    write_frame(
+        &mut stdin,
+        &ClientMsg::WriteTextFile { req_id: 5, path: edited_file.to_string_lossy().into(), content: "port: 8080\n".into() },
+    )
+    .unwrap();
+    write_frame(&mut stdin, &ClientMsg::ListServices { req_id: 6 }).unwrap();
     // 3. Open a real PTY terminal and run a command.
     write_frame(&mut stdin, &ClientMsg::OpenTerminal { term_id: 1, cols: 80, rows: 24 }).unwrap();
     write_frame(&mut stdin, &ClientMsg::TermInput { term_id: 1, data: b"echo PANE_E2E_OK\r".to_vec() }).unwrap();
@@ -62,11 +69,14 @@ fn end_to_end_stdio_session() {
     let mut download_done = false;
     let mut saw_preview = false;
     let mut saw_processes = false;
+    let mut saw_write = false;
+    let mut saw_services = false;
     let mut screen = Screen::new(80, 24);
     let mut saw_term_output = false;
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !(saw_listing && download_done && saw_preview && saw_processes && saw_term_output) {
+    while !(saw_listing && download_done && saw_preview && saw_processes && saw_write && saw_services && saw_term_output)
+    {
         assert!(Instant::now() < deadline, "timed out waiting for host messages");
         let (msg, _): (HostMsg, usize) = read_frame(&mut stdout).unwrap().expect("unexpected EOF");
         match msg {
@@ -88,6 +98,14 @@ fn end_to_end_stdio_session() {
             HostMsg::ProcessList { req_id: 4, processes } => {
                 assert!(!processes.is_empty());
                 saw_processes = true;
+            }
+            HostMsg::WriteFileResult { req_id: 5, ok, error, .. } => {
+                assert!(ok, "write failed: {error:?}");
+                assert_eq!(std::fs::read_to_string(&edited_file).unwrap(), "port: 8080\n");
+                saw_write = true;
+            }
+            HostMsg::ServiceSnapshot { req_id: 6, .. } => {
+                saw_services = true;
             }
             HostMsg::TermDiff { term_id: 1, screen_cols, screen_rows, rows, .. } => {
                 screen.apply(screen_cols, screen_rows, rows);

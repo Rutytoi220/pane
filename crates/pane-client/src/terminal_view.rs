@@ -11,6 +11,7 @@ const FONT_SIZE: f32 = 13.5;
 
 pub struct TerminalPane {
     pub id: u32,
+    pub workspace: u8,
     pub title: String,
     pub screen: Screen,
     pub closed: bool,
@@ -20,9 +21,10 @@ pub struct TerminalPane {
 }
 
 impl TerminalPane {
-    pub fn new(id: u32, cols: u16, rows: u16) -> Self {
+    pub fn new(id: u32, workspace: u8, cols: u16, rows: u16) -> Self {
         Self {
             id,
+            workspace,
             title: format!("Terminal #{id}"),
             screen: Screen::new(cols, rows),
             closed: false,

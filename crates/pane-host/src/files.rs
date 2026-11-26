@@ -147,6 +147,18 @@ pub fn read_text_file(path: &str) -> Result<(String, String, bool), String> {
     Ok((canonical.to_string_lossy().into_owned(), content, truncated))
 }
 
+/// Write UTF-8 text content back to a remote file.
+pub fn write_text_file(path: &str, content: &str) -> Result<String, String> {
+    let target = resolve(path);
+    if target.is_dir() {
+        return Err(format!("{} is a directory", target.display()));
+    }
+    fs::write(&target, content.as_bytes()).map_err(|e| format!("{}: {e}", target.display()))?;
+    let canonical = target.canonicalize().unwrap_or(target);
+    log!("saved {} ({} bytes)", canonical.display(), content.len());
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

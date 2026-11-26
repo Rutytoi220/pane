@@ -1,14 +1,13 @@
-//! Floating syntax-styled remote File Viewer window.
+//! Floating syntax-styled remote File Viewer & Editable Text/Code Editor.
 //!
-//! Renders up to 256 KiB of remote UTF-8 text/config files with line numbers,
-//! lightweight language-aware syntax coloring (YAML, TOML, JSON, Python, Rust,
-//! Shell, Dockerfile, INI, JS/TS, C/C++, Markdown), copy-to-clipboard, and
-//! virtualized row scrolling (`show_rows`) for smooth 60+ FPS performance.
+//! Renders up to 256 KiB of remote UTF-8 text/config files with line numbers
+//! and language-aware syntax coloring in Preview mode, or toggles into Edit
+//! mode to modify and save changes straight back to the remote host (`Ctrl+S`).
 
 use std::path::Path;
 
 use egui::text::LayoutJob;
-use egui::{Color32, FontId, RichText, ScrollArea, TextFormat};
+use egui::{Color32, FontId, Key, RichText, ScrollArea, TextFormat, TextWrapMode};
 use pane_proto::ClientMsg;
 
 use crate::theme;
@@ -57,6 +56,7 @@ impl Lang {
 
 pub struct FileViewerPane {
     pub id: u64,
+    pub workspace: u8,
     pub path: String,
     pub display_name: String,
     pub lines: Vec<String>,
@@ -66,11 +66,16 @@ pub struct FileViewerPane {
     pub error: Option<String>,
     pub open: bool,
     pub req_id: u64,
+    pub edit_mode: bool,
+    pub dirty: bool,
+    pub saving: bool,
+    pub save_req_id: Option<u64>,
+    pub save_status: Option<(String, bool)>,
     lang: Lang,
 }
 
 impl FileViewerPane {
-    pub fn new(id: u64, req_id: u64, path: String) -> Self {
+    pub fn new(id: u64, workspace: u8, req_id: u64, path: String) -> Self {
         let display_name = Path::new(&path)
             .file_name()
             .and_then(|s| s.to_str())
@@ -79,6 +84,7 @@ impl FileViewerPane {
         let lang = Lang::from_path(&path);
         Self {
             id,
+            workspace,
             path,
             display_name,
             lines: Vec::new(),
@@ -88,6 +94,11 @@ impl FileViewerPane {
             error: None,
             open: true,
             req_id,
+            edit_mode: false,
+            dirty: false,
+            saving: false,
+            save_req_id: None,
+            save_status: None,
             lang,
         }
     }
@@ -95,13 +106,11 @@ impl FileViewerPane {
     pub fn set_content(&mut self, path: String, content: String, truncated: bool) {
         self.path = path;
         self.lang = Lang::from_path(&self.path);
-        self.lines = content.lines().map(str::to_owned).collect();
-        if self.lines.is_empty() && !content.is_empty() {
-            self.lines.push(content.clone());
-        }
+        self.lines = split_lines(&content);
         self.raw_content = content;
         self.truncated = truncated;
         self.loading = false;
+        self.dirty = false;
         self.error = None;
     }
 
@@ -110,8 +119,47 @@ impl FileViewerPane {
         self.error = Some(message);
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, alloc_req_id: &mut impl FnMut() -> u64, out: &mut Vec<ClientMsg>) {
-        // Header bar: remote path, language badge, Refresh & Copy.
+    pub fn on_save_result(&mut self, ok: bool, error: Option<String>) {
+        self.saving = false;
+        self.save_req_id = None;
+        if ok {
+            self.dirty = false;
+            self.lines = split_lines(&self.raw_content);
+            self.save_status = Some(("Saved".into(), true));
+        } else {
+            self.save_status = Some((error.unwrap_or_else(|| "Save failed".into()), false));
+        }
+    }
+
+    fn trigger_save(&mut self, alloc_req_id: &mut impl FnMut() -> u64, out: &mut Vec<ClientMsg>) {
+        if self.saving || self.truncated {
+            return;
+        }
+        let req_id = alloc_req_id();
+        self.saving = true;
+        self.save_req_id = Some(req_id);
+        self.save_status = Some(("Saving...".into(), true));
+        out.push(ClientMsg::WriteTextFile { req_id, path: self.path.clone(), content: self.raw_content.clone() });
+    }
+
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        is_active: bool,
+        alloc_req_id: &mut impl FnMut() -> u64,
+        out: &mut Vec<ClientMsg>,
+    ) {
+        // Ctrl+S shortcut when this editor window is active in Edit mode.
+        if is_active
+            && self.edit_mode
+            && !self.loading
+            && !self.truncated
+            && ui.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(Key::S))
+        {
+            self.trigger_save(alloc_req_id, out);
+        }
+
+        // Header bar: language badge, remote path, Edit/Preview toggle, Save, Copy, Refresh.
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!("[{}]", self.lang.label()))
@@ -119,17 +167,46 @@ impl FileViewerPane {
                     .size(11.0)
                     .color(theme::ACCENT_CYAN),
             );
-            ui.label(RichText::new(&self.path).monospace().size(11.5).color(theme::TEXT_MUTED));
+            ui.add(
+                egui::Label::new(RichText::new(&self.path).monospace().size(11.0).color(theme::TEXT_MUTED))
+                    .wrap_mode(TextWrapMode::Truncate),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Copy").clicked() {
-                    ui.ctx().copy_text(self.raw_content.clone());
-                }
                 if ui.small_button("Refresh").clicked() {
                     let req_id = alloc_req_id();
                     self.req_id = req_id;
                     self.loading = true;
                     self.error = None;
+                    self.save_status = None;
                     out.push(ClientMsg::ReadTextFile { req_id, path: self.path.clone() });
+                }
+                if ui.small_button("Copy").clicked() {
+                    ui.ctx().copy_text(self.raw_content.clone());
+                }
+                if self.edit_mode {
+                    let save_label = if self.saving {
+                        "Saving..."
+                    } else if self.dirty {
+                        "Save* (Ctrl+S)"
+                    } else {
+                        "Save (Ctrl+S)"
+                    };
+                    let save_col = if self.dirty { theme::ACCENT_GREEN } else { theme::TEXT_PRIMARY };
+                    if ui.add_enabled(!self.saving, egui::Button::new(RichText::new(save_label).color(save_col)).small()).clicked() {
+                        self.trigger_save(alloc_req_id, out);
+                    }
+                    if ui.small_button("Preview").clicked() {
+                        self.lines = split_lines(&self.raw_content);
+                        self.edit_mode = false;
+                    }
+                } else {
+                    let edit_btn = ui
+                        .add_enabled(!self.truncated && !self.loading, egui::Button::new("Edit").small())
+                        .on_disabled_hover_text("File exceeds 256 KB preview limit; download to edit");
+                    if edit_btn.clicked() {
+                        self.edit_mode = true;
+                        self.save_status = None;
+                    }
                 }
             });
         });
@@ -141,6 +218,10 @@ impl FileViewerPane {
                     .color(theme::ACCENT_AMBER),
             );
         }
+        if let Some((msg, ok)) = &self.save_status {
+            let col = if *ok { theme::ACCENT_GREEN } else { theme::ACCENT_CORAL };
+            ui.label(RichText::new(msg).small().color(col));
+        }
 
         ui.separator();
 
@@ -150,6 +231,31 @@ impl FileViewerPane {
         }
         if let Some(err) = &self.error {
             ui.label(RichText::new(err).monospace().color(theme::ACCENT_CORAL));
+            return;
+        }
+
+        if self.edit_mode {
+            egui::Frame::new()
+                .fill(theme::BG_TERM)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER_FOCUS))
+                .corner_radius(3.0)
+                .inner_margin(6.0)
+                .show(ui, |ui| {
+                    ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                        let avail = ui.available_size();
+                        let resp = ui.add_sized(
+                            avail,
+                            egui::TextEdit::multiline(&mut self.raw_content)
+                                .code_editor()
+                                .desired_width(f32::INFINITY)
+                                .lock_focus(true),
+                        );
+                        if resp.changed() {
+                            self.dirty = true;
+                            self.save_status = None;
+                        }
+                    });
+                });
             return;
         }
 
@@ -175,6 +281,14 @@ impl FileViewerPane {
     }
 }
 
+fn split_lines(content: &str) -> Vec<String> {
+    let mut lines: Vec<String> = content.lines().map(str::to_owned).collect();
+    if lines.is_empty() && !content.is_empty() {
+        lines.push(content.to_owned());
+    }
+    lines
+}
+
 fn highlight_line(line_no: usize, gutter_w: usize, line: &str, lang: Lang, font: &FontId) -> LayoutJob {
     let mut job = LayoutJob::default();
     let push = |job: &mut LayoutJob, text: &str, color: Color32| {
@@ -183,11 +297,9 @@ fn highlight_line(line_no: usize, gutter_w: usize, line: &str, lang: Lang, font:
         }
     };
 
-    // Line number gutter.
     push(&mut job, &format!("{line_no:>gutter_w$} | "), Color32::from_rgb(76, 90, 114));
 
     let trimmed = line.trim_start();
-    // Whole-line comments.
     let is_hash_comment = matches!(lang, Lang::Yaml | Lang::Toml | Lang::Python | Lang::Shell) && trimmed.starts_with('#');
     let is_slash_comment = matches!(lang, Lang::Rust | Lang::Json) && trimmed.starts_with("//");
     if is_hash_comment || is_slash_comment {
@@ -195,13 +307,11 @@ fn highlight_line(line_no: usize, gutter_w: usize, line: &str, lang: Lang, font:
         return job;
     }
 
-    // TOML/INI section header `[section]`.
     if lang == Lang::Toml && trimmed.starts_with('[') && trimmed.ends_with(']') {
         push(&mut job, line, theme::ACCENT_VIOLET);
         return job;
     }
 
-    // YAML/TOML/JSON `key: value` or `key = value` split.
     if matches!(lang, Lang::Yaml | Lang::Toml | Lang::Json) {
         let sep = if lang == Lang::Toml { '=' } else { ':' };
         if let Some(pos) = find_unquoted_sep(line, sep) {
@@ -243,7 +353,6 @@ fn highlight_tokens(job: &mut LayoutJob, s: &str, lang: Lang, font: &FontId) {
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        // Inline comments.
         if b == b'#' && matches!(lang, Lang::Yaml | Lang::Toml | Lang::Python | Lang::Shell) {
             push(job, &s[i..], Color32::from_rgb(100, 118, 142));
             return;
@@ -253,7 +362,6 @@ fn highlight_tokens(job: &mut LayoutJob, s: &str, lang: Lang, font: &FontId) {
             return;
         }
 
-        // Quoted strings.
         if b == b'"' || b == b'\'' {
             let quote = b;
             let start = i;
@@ -273,7 +381,6 @@ fn highlight_tokens(job: &mut LayoutJob, s: &str, lang: Lang, font: &FontId) {
             continue;
         }
 
-        // Identifiers / keywords / booleans / numbers.
         if b.is_ascii_alphanumeric() || b == b'_' {
             let start = i;
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'.' | b'-')) {
@@ -293,7 +400,6 @@ fn highlight_tokens(job: &mut LayoutJob, s: &str, lang: Lang, font: &FontId) {
             continue;
         }
 
-        // Single punctuation / whitespace / UTF-8 char.
         let ch_len = s[i..].chars().next().map(char::len_utf8).unwrap_or(1);
         push(job, &s[i..i + ch_len], theme::TEXT_PRIMARY);
         i += ch_len;

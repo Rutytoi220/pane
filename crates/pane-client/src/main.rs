@@ -2,9 +2,11 @@
 
 mod app;
 mod files_view;
+mod launcher;
 mod metrics;
 mod monitor_view;
 mod processes_view;
+mod services_view;
 mod terminal_view;
 mod theme;
 mod transport;

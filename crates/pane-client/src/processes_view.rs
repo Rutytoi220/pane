@@ -20,6 +20,7 @@ enum SortCol {
 
 pub struct ProcessManager {
     pub open: bool,
+    pub workspace: u8,
     pub processes: Vec<ProcessInfo>,
     pub filter: String,
     sort_col: SortCol,
@@ -32,6 +33,7 @@ impl ProcessManager {
     pub fn new() -> Self {
         Self {
             open: false,
+            workspace: 1,
             processes: Vec::new(),
             filter: String::new(),
             sort_col: SortCol::Cpu,

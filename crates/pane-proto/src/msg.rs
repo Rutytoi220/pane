@@ -36,11 +36,20 @@ pub enum ClientMsg {
     DownloadFile { req_id: u64, path: String },
     /// Read up to [`crate::MAX_TEXT_PREVIEW_BYTES`] of a remote UTF-8 text file for preview.
     ReadTextFile { req_id: u64, path: String },
+    /// Save edited UTF-8 text back to a remote file.
+    WriteTextFile { req_id: u64, path: String, content: String },
 
     /// Request a snapshot of top running processes on the remote host.
     ListProcesses { req_id: u64 },
     /// Send a POSIX signal (e.g. `15` = SIGTERM, `9` = SIGKILL) to a remote PID.
     KillProcess { req_id: u64, pid: u32, signal: i32 },
+
+    /// Query running systemd services and Docker containers on the remote host.
+    ListServices { req_id: u64 },
+    /// Restart, stop, or start a systemd service unit.
+    ControlService { req_id: u64, name: String, action: ServiceAction },
+    /// Restart, stop, or start a Docker container by ID or name.
+    ControlContainer { req_id: u64, id: String, action: ServiceAction },
 }
 
 /// Messages sent from the remote headless host to the local GPU client.
@@ -102,8 +111,20 @@ pub enum HostMsg {
 
     /// Reply to [`ClientMsg::ReadTextFile`].
     TextFileContent { req_id: u64, path: String, content: String, truncated: bool },
+    /// Reply to [`ClientMsg::WriteTextFile`].
+    WriteFileResult { req_id: u64, path: String, ok: bool, error: Option<String> },
     /// Reply to [`ClientMsg::ListProcesses`].
     ProcessList { req_id: u64, processes: Vec<ProcessInfo> },
+    /// Reply to [`ClientMsg::ListServices`].
+    ServiceSnapshot {
+        req_id: u64,
+        services: Vec<ServiceInfo>,
+        containers: Vec<ContainerInfo>,
+        systemd_available: bool,
+        docker_available: bool,
+    },
+    /// Reply to [`ClientMsg::ControlService`] or [`ClientMsg::ControlContainer`].
+    ControlResult { req_id: u64, target: String, ok: bool, message: String },
 }
 
 /// Summary of one remote process from `/proc`.
@@ -113,6 +134,43 @@ pub struct ProcessInfo {
     pub name: String,
     pub cpu_percent: f32,
     pub rss_mb: f32,
+    pub state: String,
+}
+
+/// Action to perform on a remote systemd service or Docker container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServiceAction {
+    Start,
+    Restart,
+    Stop,
+}
+
+impl ServiceAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Restart => "restart",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+/// Summary of one systemd service unit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceInfo {
+    pub name: String,
+    pub active_state: String,
+    pub sub_state: String,
+    pub description: String,
+}
+
+/// Summary of one Docker container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerInfo {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    pub status: String,
     pub state: String,
 }
 
