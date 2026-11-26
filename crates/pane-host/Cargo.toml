@@ -1,0 +1,13 @@
+[package]
+name = "pane-host"
+description = "Headless pane agent: PTYs, file browser and telemetry streamed as state diffs over stdio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pane-proto.workspace = true
+portable-pty.workspace = true
+vt100.workspace = true
+crossbeam-channel.workspace = true

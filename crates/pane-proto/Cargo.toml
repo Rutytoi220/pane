@@ -1,0 +1,13 @@
+[package]
+name = "pane-proto"
+description = "Shared wire protocol, binary framing and terminal state-diff engine for pane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+lz4_flex.workspace = true
+thiserror.workspace = true
