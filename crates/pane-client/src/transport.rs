@@ -24,25 +24,34 @@ const DEFAULT_HOST_BIN: &str = "pane-host";
 const EMBEDDED_HOST_BIN: &[u8] =
     include_bytes!("../../../target/x86_64-unknown-linux-musl/release/pane-host");
 
-/// Cached remote path where the embedded agent is deployed.
-const REMOTE_DEPLOY_PATH: &str = concat!("~/.cache/pane/pane-host-", env!("CARGO_PKG_VERSION"));
+/// Compute a fast deterministic 64-bit FNV-1a fingerprint of the embedded binary
+/// so any rebuild of `pane-host` automatically invalidates stale remote caches.
+fn embedded_bin_hash() -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in EMBEDDED_HOST_BIN {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
 
-/// Atomic remote install command: skips upload if the versioned binary already
-/// exists and is executable; otherwise streams stdin to a `.tmp` file, marks it
-/// executable, and atomically renames it into place.
-const REMOTE_BOOTSTRAP_CMD: &str = concat!(
-    "mkdir -p ~/.cache/pane && if [ ! -x ~/.cache/pane/pane-host-",
-    env!("CARGO_PKG_VERSION"),
-    " ]; then cat > ~/.cache/pane/pane-host-",
-    env!("CARGO_PKG_VERSION"),
-    ".tmp && chmod +x ~/.cache/pane/pane-host-",
-    env!("CARGO_PKG_VERSION"),
-    ".tmp && mv ~/.cache/pane/pane-host-",
-    env!("CARGO_PKG_VERSION"),
-    ".tmp ~/.cache/pane/pane-host-",
-    env!("CARGO_PKG_VERSION"),
-    "; fi",
-);
+/// Content-addressed cached remote path (`$HOME/.cache/pane/pane-host-<ver>-<hash>`).
+fn remote_deploy_path() -> String {
+    format!("$HOME/.cache/pane/pane-host-{}-{:016x}", env!("CARGO_PKG_VERSION"), embedded_bin_hash())
+}
+
+/// Atomic remote install command: skips upload if this exact binary fingerprint
+/// is already installed; otherwise writes to `.tmp`, marks executable, swaps in
+/// atomically, and prunes older cached `pane-host-*` binaries.
+fn remote_bootstrap_cmd(deploy_path: &str) -> String {
+    format!(
+        "mkdir -p \"$HOME/.cache/pane\" && if [ ! -x \"{deploy_path}\" ]; then \
+         cat > \"{deploy_path}.tmp\" && chmod +x \"{deploy_path}.tmp\" && \
+         mv \"{deploy_path}.tmp\" \"{deploy_path}\" && \
+         find \"$HOME/.cache/pane\" -maxdepth 1 -type f -name 'pane-host-*' ! -path \"{deploy_path}\" -delete 2>/dev/null || true; \
+         fi"
+    )
+}
 
 /// How the client connects to `pane-host`.
 #[derive(Debug, Clone)]
@@ -83,13 +92,14 @@ impl Transport {
         // Zero-config SSH bootstrap when `--host-bin` is left at its default.
         let effective_remote_bin = match mode {
             LaunchMode::Ssh { target, host_bin, ssh_opts } if host_bin == DEFAULT_HOST_BIN => {
-                bootstrap_remote_host(target, ssh_opts)?;
-                Some(REMOTE_DEPLOY_PATH)
+                let deploy_path = remote_deploy_path();
+                bootstrap_remote_host(target, ssh_opts, &deploy_path)?;
+                Some(deploy_path)
             }
             _ => None,
         };
 
-        let mut cmd = build_command(mode, effective_remote_bin);
+        let mut cmd = build_command(mode, effective_remote_bin.as_deref());
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = cmd.spawn().with_context(|| match mode {
@@ -200,11 +210,11 @@ fn ssh_base_command(target: &str, ssh_opts: &[String]) -> Command {
     cmd
 }
 
-/// Ensure the embedded static `pane-host` binary is installed at
-/// [`REMOTE_DEPLOY_PATH`] on `target`.
-fn bootstrap_remote_host(target: &str, ssh_opts: &[String]) -> Result<()> {
+/// Ensure the embedded static `pane-host` binary is installed at `deploy_path`
+/// on `target`.
+fn bootstrap_remote_host(target: &str, ssh_opts: &[String], deploy_path: &str) -> Result<()> {
     let mut cmd = ssh_base_command(target, ssh_opts);
-    cmd.arg(REMOTE_BOOTSTRAP_CMD)
+    cmd.arg(remote_bootstrap_cmd(deploy_path))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -295,11 +305,13 @@ mod tests {
 
     #[test]
     fn bootstrap_and_deploy_commands_match_expected() {
-        assert_eq!(REMOTE_DEPLOY_PATH, "~/.cache/pane/pane-host-0.1.0");
-        assert_eq!(
-            REMOTE_BOOTSTRAP_CMD,
-            "mkdir -p ~/.cache/pane && if [ ! -x ~/.cache/pane/pane-host-0.1.0 ]; then cat > ~/.cache/pane/pane-host-0.1.0.tmp && chmod +x ~/.cache/pane/pane-host-0.1.0.tmp && mv ~/.cache/pane/pane-host-0.1.0.tmp ~/.cache/pane/pane-host-0.1.0; fi"
-        );
+        let deploy_path = remote_deploy_path();
+        assert!(deploy_path.starts_with("$HOME/.cache/pane/pane-host-0.1.0-"));
+        assert_eq!(deploy_path.len(), "$HOME/.cache/pane/pane-host-0.1.0-".len() + 16);
+        let cmd = remote_bootstrap_cmd(&deploy_path);
+        assert!(cmd.contains(&deploy_path));
+        assert!(cmd.contains("chmod +x"));
+        assert!(cmd.contains("-delete"));
     }
 
     #[test]
@@ -314,8 +326,9 @@ mod tests {
         assert_eq!(args.last().map(String::as_str), Some("/opt/bin/pane-host"));
         assert!(args.contains(&"Port=2222".to_string()));
 
-        let deployed = build_command(&mode, Some(REMOTE_DEPLOY_PATH));
+        let deploy_path = remote_deploy_path();
+        let deployed = build_command(&mode, Some(&deploy_path));
         let args2: Vec<_> = deployed.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(args2.last().map(String::as_str), Some("~/.cache/pane/pane-host-0.1.0"));
+        assert_eq!(args2.last().map(String::as_str), Some(deploy_path.as_str()));
     }
 }
