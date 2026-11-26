@@ -17,6 +17,7 @@ macro_rules! log {
 
 mod files;
 mod outbox;
+mod processes;
 mod sysinfo;
 mod telemetry;
 mod terminal;
@@ -51,6 +52,7 @@ fn main() {
 
     let outbox = Outbox::spawn(io::stdout());
     let terminals = TerminalManager::spawn(outbox.clone());
+    let mut proc_mon = processes::ProcessMonitor::new();
     let mut telemetry_started = false;
 
     let mut stdin = BufReader::with_capacity(64 * 1024, io::stdin().lock());
@@ -121,6 +123,24 @@ fn main() {
                 outbox.send(reply);
             }
             ClientMsg::DownloadFile { req_id, path } => files::spawn_download(req_id, path, outbox.clone()),
+            ClientMsg::ReadTextFile { req_id, path } => {
+                let reply = match files::read_text_file(&path) {
+                    Ok((path, content, truncated)) => HostMsg::TextFileContent { req_id, path, content, truncated },
+                    Err(message) => HostMsg::Error { req_id: Some(req_id), message },
+                };
+                outbox.send(reply);
+            }
+            ClientMsg::ListProcesses { req_id } => {
+                let processes = proc_mon.snapshot();
+                outbox.send(HostMsg::ProcessList { req_id, processes });
+            }
+            ClientMsg::KillProcess { req_id, pid, signal } => match processes::kill_process(pid, signal) {
+                Ok(()) => {
+                    let processes = proc_mon.snapshot();
+                    outbox.send(HostMsg::ProcessList { req_id, processes });
+                }
+                Err(message) => outbox.send(HostMsg::Error { req_id: Some(req_id), message }),
+            },
         }
     }
 

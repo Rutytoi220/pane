@@ -21,7 +21,9 @@ pub use frame::{
     COMPRESS_THRESHOLD, FLAG_LZ4, FrameDecoder, FrameError, HEADER_LEN, MAX_FRAME_LEN, decode_payload,
     encode_frame, read_frame, write_frame,
 };
-pub use msg::{ClientMsg, DirEntry, HostMsg, PROTOCOL_VERSION};
+pub use msg::{ClientMsg, DirEntry, HostMsg, PROTOCOL_VERSION, ProcessInfo};
 
 /// Size of a single file-transfer chunk sent in [`HostMsg::FileChunk`].
 pub const FILE_CHUNK_SIZE: usize = 64 * 1024;
+/// Maximum UTF-8 bytes returned by [`ClientMsg::ReadTextFile`] (256 KiB).
+pub const MAX_TEXT_PREVIEW_BYTES: usize = 256 * 1024;

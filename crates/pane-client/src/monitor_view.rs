@@ -48,7 +48,7 @@ impl SystemMonitor {
                 ui.label(RichText::new(&h.hostname).strong().color(theme::TEXT_PRIMARY));
                 ui.label(RichText::new(format!("{} cores", h.cpu_cores)).small().color(theme::TEXT_MUTED));
             } else {
-                ui.label(RichText::new("Connecting…").color(theme::TEXT_MUTED));
+                ui.label(RichText::new("Connecting...").color(theme::TEXT_MUTED));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let dock_label = if self.docked { "Float" } else { "Dock" };

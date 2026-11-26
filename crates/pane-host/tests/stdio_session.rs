@@ -49,6 +49,9 @@ fn end_to_end_stdio_session() {
     write_frame(&mut stdin, &ClientMsg::ListDir { req_id: 1, path: tmp.to_string_lossy().into() }).unwrap();
     write_frame(&mut stdin, &ClientMsg::DownloadFile { req_id: 2, path: sample_file.to_string_lossy().into() })
         .unwrap();
+    write_frame(&mut stdin, &ClientMsg::ReadTextFile { req_id: 3, path: sample_file.to_string_lossy().into() })
+        .unwrap();
+    write_frame(&mut stdin, &ClientMsg::ListProcesses { req_id: 4 }).unwrap();
     // 3. Open a real PTY terminal and run a command.
     write_frame(&mut stdin, &ClientMsg::OpenTerminal { term_id: 1, cols: 80, rows: 24 }).unwrap();
     write_frame(&mut stdin, &ClientMsg::TermInput { term_id: 1, data: b"echo PANE_E2E_OK\r".to_vec() }).unwrap();
@@ -57,11 +60,13 @@ fn end_to_end_stdio_session() {
     let mut saw_listing = false;
     let mut downloaded = Vec::new();
     let mut download_done = false;
+    let mut saw_preview = false;
+    let mut saw_processes = false;
     let mut screen = Screen::new(80, 24);
     let mut saw_term_output = false;
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !(saw_listing && download_done && saw_term_output) {
+    while !(saw_listing && download_done && saw_preview && saw_processes && saw_term_output) {
         assert!(Instant::now() < deadline, "timed out waiting for host messages");
         let (msg, _): (HostMsg, usize) = read_frame(&mut stdout).unwrap().expect("unexpected EOF");
         match msg {
@@ -74,6 +79,15 @@ fn end_to_end_stdio_session() {
                 if eof {
                     download_done = true;
                 }
+            }
+            HostMsg::TextFileContent { req_id: 3, content, truncated, .. } => {
+                assert!(!truncated);
+                assert!(content.starts_with("pane retained-mode state diff payload"));
+                saw_preview = true;
+            }
+            HostMsg::ProcessList { req_id: 4, processes } => {
+                assert!(!processes.is_empty());
+                saw_processes = true;
             }
             HostMsg::TermDiff { term_id: 1, screen_cols, screen_rows, rows, .. } => {
                 screen.apply(screen_cols, screen_rows, rows);

@@ -34,6 +34,13 @@ pub enum ClientMsg {
     ListDir { req_id: u64, path: String },
     /// Stream a remote file back in [`crate::FILE_CHUNK_SIZE`] chunks.
     DownloadFile { req_id: u64, path: String },
+    /// Read up to [`crate::MAX_TEXT_PREVIEW_BYTES`] of a remote UTF-8 text file for preview.
+    ReadTextFile { req_id: u64, path: String },
+
+    /// Request a snapshot of top running processes on the remote host.
+    ListProcesses { req_id: u64 },
+    /// Send a POSIX signal (e.g. `15` = SIGTERM, `9` = SIGKILL) to a remote PID.
+    KillProcess { req_id: u64, pid: u32, signal: i32 },
 }
 
 /// Messages sent from the remote headless host to the local GPU client.
@@ -92,6 +99,21 @@ pub enum HostMsg {
 
     /// A request failed. `req_id` refers to the originating request, if any.
     Error { req_id: Option<u64>, message: String },
+
+    /// Reply to [`ClientMsg::ReadTextFile`].
+    TextFileContent { req_id: u64, path: String, content: String, truncated: bool },
+    /// Reply to [`ClientMsg::ListProcesses`].
+    ProcessList { req_id: u64, processes: Vec<ProcessInfo> },
+}
+
+/// Summary of one remote process from `/proc`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub name: String,
+    pub cpu_percent: f32,
+    pub rss_mb: f32,
+    pub state: String,
 }
 
 /// One entry of a remote directory listing.

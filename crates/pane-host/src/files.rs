@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use pane_proto::{DirEntry, FILE_CHUNK_SIZE, HostMsg};
+use pane_proto::{DirEntry, FILE_CHUNK_SIZE, HostMsg, MAX_TEXT_PREVIEW_BYTES};
 
 use crate::outbox::Outbox;
 
@@ -117,6 +117,36 @@ fn read_full(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(filled)
 }
 
+/// Read up to [`MAX_TEXT_PREVIEW_BYTES`] (256 KiB) of a UTF-8 text file for
+/// quick remote inspection in the client's File Viewer.
+pub fn read_text_file(path: &str) -> Result<(String, String, bool), String> {
+    let resolved = resolve(path);
+    let canonical = resolved.canonicalize().map_err(|e| format!("{}: {e}", resolved.display()))?;
+    let meta = fs::metadata(&canonical).map_err(|e| format!("{}: {e}", canonical.display()))?;
+    if meta.is_dir() {
+        return Err(format!("{} is a directory", canonical.display()));
+    }
+    let mut file = File::open(&canonical).map_err(|e| format!("{}: {e}", canonical.display()))?;
+    let mut buf = vec![0u8; MAX_TEXT_PREVIEW_BYTES + 1];
+    let n = read_full(&mut file, &mut buf).map_err(|e| format!("{}: {e}", canonical.display()))?;
+    let truncated = n > MAX_TEXT_PREVIEW_BYTES;
+    buf.truncate(n.min(MAX_TEXT_PREVIEW_BYTES));
+
+    if buf.iter().take(8192).any(|&b| b == 0) {
+        return Err(format!("{} appears to be a binary file (use [DL] to download)", canonical.display()));
+    }
+
+    // If we truncated mid-character, trim the incomplete trailing UTF-8 sequence.
+    let mut valid_len = buf.len();
+    if truncated {
+        while valid_len > 0 && std::str::from_utf8(&buf[..valid_len]).is_err() && buf.len() - valid_len < 4 {
+            valid_len -= 1;
+        }
+    }
+    let content = String::from_utf8_lossy(&buf[..valid_len]).into_owned();
+    Ok((canonical.to_string_lossy().into_owned(), content, truncated))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +170,29 @@ mod tests {
         assert_eq!(resolve(""), home_dir());
         assert_eq!(resolve("~/x"), home_dir().join("x"));
         assert_eq!(resolve("/etc"), PathBuf::from("/etc"));
+    }
+
+    #[test]
+    fn read_text_file_handles_small_truncated_and_binary() {
+        let tmp = std::env::temp_dir().join(format!("pane-host-preview-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+
+        let small = tmp.join("config.yml");
+        fs::write(&small, "version: '3'\nservices:\n  web:\n    image: nginx\n").unwrap();
+        let (_, text, trunc) = read_text_file(small.to_str().unwrap()).unwrap();
+        assert!(!trunc);
+        assert!(text.contains("image: nginx"));
+
+        let huge = tmp.join("big.log");
+        fs::write(&huge, "A".repeat(MAX_TEXT_PREVIEW_BYTES + 1024)).unwrap();
+        let (_, text2, trunc2) = read_text_file(huge.to_str().unwrap()).unwrap();
+        assert!(trunc2);
+        assert_eq!(text2.len(), MAX_TEXT_PREVIEW_BYTES);
+
+        let bin = tmp.join("data.bin");
+        fs::write(&bin, b"\x7fELF\x00\x01\x02").unwrap();
+        assert!(read_text_file(bin.to_str().unwrap()).is_err());
+
+        fs::remove_dir_all(tmp).unwrap();
     }
 }
