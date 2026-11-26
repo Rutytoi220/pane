@@ -1,15 +1,48 @@
-//! Stdio transport layer: spawns either `ssh -T user@host pane-host` or a
+//! Stdio transport layer: spawns either `ssh -T user@host <pane-host>` or a
 //! local `pane-host` (`--demo`), and exchanges framed `ClientMsg` / `HostMsg`
 //! packets on background threads.
+//!
+//! When connecting over SSH with the default `--host-bin` (`"pane-host"`), the
+//! static `x86_64-unknown-linux-musl` `pane-host` binary embedded in this
+//! executable is automatically deployed to `~/.cache/pane/pane-host-<version>`
+//! on the remote machine if not already present.
 
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use pane_proto::{ClientMsg, FrameError, HostMsg, read_frame, write_frame};
+
+/// Default CLI `--host-bin` value that triggers zero-config SSH auto-deploy.
+const DEFAULT_HOST_BIN: &str = "pane-host";
+
+/// Static `x86_64-unknown-linux-musl` build of `pane-host` embedded for
+/// zero-config deployment onto any x86_64 Linux host.
+const EMBEDDED_HOST_BIN: &[u8] =
+    include_bytes!("../../../target/x86_64-unknown-linux-musl/release/pane-host");
+
+/// Cached remote path where the embedded agent is deployed.
+const REMOTE_DEPLOY_PATH: &str = concat!("~/.cache/pane/pane-host-", env!("CARGO_PKG_VERSION"));
+
+/// Atomic remote install command: skips upload if the versioned binary already
+/// exists and is executable; otherwise streams stdin to a `.tmp` file, marks it
+/// executable, and atomically renames it into place.
+const REMOTE_BOOTSTRAP_CMD: &str = concat!(
+    "mkdir -p ~/.cache/pane && if [ ! -x ~/.cache/pane/pane-host-",
+    env!("CARGO_PKG_VERSION"),
+    " ]; then cat > ~/.cache/pane/pane-host-",
+    env!("CARGO_PKG_VERSION"),
+    ".tmp && chmod +x ~/.cache/pane/pane-host-",
+    env!("CARGO_PKG_VERSION"),
+    ".tmp && mv ~/.cache/pane/pane-host-",
+    env!("CARGO_PKG_VERSION"),
+    ".tmp ~/.cache/pane/pane-host-",
+    env!("CARGO_PKG_VERSION"),
+    "; fi",
+);
 
 /// How the client connects to `pane-host`.
 #[derive(Debug, Clone)]
@@ -47,7 +80,16 @@ pub struct Transport {
 
 impl Transport {
     pub fn connect(mode: &LaunchMode, ctx: egui::Context) -> Result<Self> {
-        let mut cmd = build_command(mode)?;
+        // Zero-config SSH bootstrap when `--host-bin` is left at its default.
+        let effective_remote_bin = match mode {
+            LaunchMode::Ssh { target, host_bin, ssh_opts } if host_bin == DEFAULT_HOST_BIN => {
+                bootstrap_remote_host(target, ssh_opts)?;
+                Some(REMOTE_DEPLOY_PATH)
+            }
+            _ => None,
+        };
+
+        let mut cmd = build_command(mode, effective_remote_bin);
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = cmd.spawn().with_context(|| match mode {
@@ -147,18 +189,73 @@ impl Drop for Transport {
     }
 }
 
-fn build_command(mode: &LaunchMode) -> Result<Command> {
+fn ssh_base_command(target: &str, ssh_opts: &[String]) -> Command {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-T"); // Disable remote PTY so stdio stays pure binary.
+    cmd.args(["-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]);
+    for opt in ssh_opts {
+        cmd.args(["-o", opt]);
+    }
+    cmd.arg(target);
+    cmd
+}
+
+/// Ensure the embedded static `pane-host` binary is installed at
+/// [`REMOTE_DEPLOY_PATH`] on `target`.
+fn bootstrap_remote_host(target: &str, ssh_opts: &[String]) -> Result<()> {
+    let mut cmd = ssh_base_command(target, ssh_opts);
+    cmd.arg(REMOTE_BOOTSTRAP_CMD)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn ssh while bootstrapping pane-host on {target}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        // If the remote already has the cached binary, the remote shell exits
+        // without running `cat`, which can surface as BrokenPipe here.
+        if let Err(e) = stdin.write_all(EMBEDDED_HOST_BIN)
+            && e.kind() != io::ErrorKind::BrokenPipe
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e).with_context(|| format!("failed to stream pane-host binary to {target}"));
+        }
+        // Explicitly close stdin so remote `cat` sees EOF.
+        drop(stdin);
+    }
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed while waiting for remote bootstrap on {target}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            bail!(
+                "SSH bootstrap of pane-host on {target} failed (exit status: {}). \
+                 Verify SSH authentication and remote shell access.",
+                output.status
+            );
+        } else {
+            bail!(
+                "SSH bootstrap of pane-host on {target} failed (exit status: {}): {stderr}",
+                output.status
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn build_command(mode: &LaunchMode, deployed_remote_bin: Option<&str>) -> Command {
     match mode {
         LaunchMode::Ssh { target, host_bin, ssh_opts } => {
-            let mut cmd = Command::new("ssh");
-            cmd.arg("-T"); // Disable remote PTY so stdout stays pure binary.
-            cmd.args(["-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]);
-            for opt in ssh_opts {
-                cmd.args(["-o", opt]);
-            }
-            cmd.arg(target);
-            cmd.arg(host_bin);
-            Ok(cmd)
+            let mut cmd = ssh_base_command(target, ssh_opts);
+            cmd.arg(deployed_remote_bin.unwrap_or(host_bin.as_str()));
+            cmd
         }
         LaunchMode::Demo { host_bin_override } => {
             let bin = if let Some(custom) = host_bin_override {
@@ -166,7 +263,7 @@ fn build_command(mode: &LaunchMode) -> Result<Command> {
             } else {
                 locate_local_host_bin()
             };
-            Ok(Command::new(bin))
+            Command::new(bin)
         }
     }
 }
@@ -184,4 +281,41 @@ fn locate_local_host_bin() -> PathBuf {
         }
     }
     PathBuf::from(exe_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_host_binary_is_static_elf() {
+        assert!(EMBEDDED_HOST_BIN.len() > 100_000, "embedded musl binary unexpectedly small");
+        assert_eq!(&EMBEDDED_HOST_BIN[..4], b"\x7fELF", "embedded binary must be an ELF executable");
+    }
+
+    #[test]
+    fn bootstrap_and_deploy_commands_match_expected() {
+        assert_eq!(REMOTE_DEPLOY_PATH, "~/.cache/pane/pane-host-0.1.0");
+        assert_eq!(
+            REMOTE_BOOTSTRAP_CMD,
+            "mkdir -p ~/.cache/pane && if [ ! -x ~/.cache/pane/pane-host-0.1.0 ]; then cat > ~/.cache/pane/pane-host-0.1.0.tmp && chmod +x ~/.cache/pane/pane-host-0.1.0.tmp && mv ~/.cache/pane/pane-host-0.1.0.tmp ~/.cache/pane/pane-host-0.1.0; fi"
+        );
+    }
+
+    #[test]
+    fn build_command_respects_custom_vs_deployed_host_bin() {
+        let mode = LaunchMode::Ssh {
+            target: "dev@example.com".into(),
+            host_bin: "/opt/bin/pane-host".into(),
+            ssh_opts: vec!["Port=2222".into()],
+        };
+        let custom = build_command(&mode, None);
+        let args: Vec<_> = custom.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args.last().map(String::as_str), Some("/opt/bin/pane-host"));
+        assert!(args.contains(&"Port=2222".to_string()));
+
+        let deployed = build_command(&mode, Some(REMOTE_DEPLOY_PATH));
+        let args2: Vec<_> = deployed.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args2.last().map(String::as_str), Some("~/.cache/pane/pane-host-0.1.0"));
+    }
 }

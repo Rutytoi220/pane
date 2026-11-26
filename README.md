@@ -61,8 +61,13 @@ Every message on `stdin`/`stdout` uses a deterministic binary frame envelope:
 ### Build & Test
 
 ```bash
+# 1. Build the static musl remote agent (embedded into the client for zero-config SSH deploy)
+rustup target add x86_64-unknown-linux-musl
+cargo build --release -p pane-host --target x86_64-unknown-linux-musl
+
+# 2. Build & test the workspace
 cargo test --workspace
-cargo build --workspace
+cargo build --release -p pane-client
 ```
 
 ### Offline Demo Mode (zero network setup)
@@ -73,22 +78,15 @@ Spawns a local `pane-host` child process over stdio pipes so you can test the fu
 cargo run --bin pane -- --demo
 ```
 
-### Connect to a Remote Host over SSH
+### Connect to Any Headless x86_64 Linux Host over SSH (Zero-Config)
 
-1. Build and copy the headless `pane-host` binary onto the remote Linux server (somewhere in `$PATH`, e.g. `~/.local/bin/pane-host`):
-
-```bash
-cargo build --release -p pane-host
-scp target/release/pane-host user@host:~/.local/bin/pane-host
-```
-
-2. Launch the local GPU workspace over SSH:
+No pre-installation required on the server — `pane` embeds the static musl `pane-host` binary and automatically uploads it once to `~/.cache/pane/pane-host-0.1.0` over SSH before launching the session:
 
 ```bash
-cargo run --release --bin pane -- user@host
+./target/release/pane user@host
 ```
 
-If `pane-host` lives at a non-standard remote path, pass `--host-bin`:
+To skip auto-deploy and execute a custom remote binary path instead, pass `--host-bin`:
 
 ```bash
 pane user@host --host-bin /opt/bin/pane-host
