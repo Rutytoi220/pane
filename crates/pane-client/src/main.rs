@@ -10,16 +10,19 @@ mod theme;
 mod transport;
 mod viewer_view;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
+
+const DEFAULT_TARGET: &str = "rutytoi@100.100.33.5";
 
 /// Zero-daemon, retained-mode remote desktop workspace over SSH stdio.
 #[derive(Debug, Parser)]
 #[command(name = "pane", version, about)]
-struct Cli {
+struct Args {
     /// SSH destination (e.g. `user@host` or an `~/.ssh/config` host alias).
-    /// Omit when using `--demo`.
-    target: Option<String>,
+    /// Defaults to `rutytoi@100.100.33.5` unless `--demo` is passed.
+    #[arg(default_value = DEFAULT_TARGET)]
+    target: String,
 
     /// Path to `pane-host` on the remote machine.
     #[arg(long, default_value = "pane-host")]
@@ -35,17 +38,15 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let args = Args::parse();
 
-    let mode = if cli.demo {
-        transport::LaunchMode::Demo { host_bin_override: (cli.host_bin != "pane-host").then_some(cli.host_bin) }
-    } else if let Some(target) = cli.target {
-        transport::LaunchMode::Ssh { target, host_bin: cli.host_bin, ssh_opts: cli.ssh_opts }
+    let mode = if args.demo {
+        transport::LaunchMode::Demo { host_bin_override: (args.host_bin != "pane-host").then_some(args.host_bin) }
     } else {
-        bail!("provide an SSH target (e.g. `pane user@host`) or run `pane --demo`");
+        transport::LaunchMode::Ssh { target: args.target, host_bin: args.host_bin, ssh_opts: args.ssh_opts }
     };
 
-    let title = format!("pane — {}", mode.label());
+    let title = format!("pane - {}", mode.label());
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(&title)
@@ -64,4 +65,28 @@ fn main() -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
     .context("failed to start native GPU workspace")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_defaults_to_default_target() {
+        let a = Args::try_parse_from(["pane"]).unwrap();
+        assert!(!a.demo);
+        assert_eq!(a.target, DEFAULT_TARGET);
+        assert_eq!(a.host_bin, "pane-host");
+    }
+
+    #[test]
+    fn cli_allows_demo_and_custom_target_override() {
+        let demo = Args::try_parse_from(["pane", "--demo"]).unwrap();
+        assert!(demo.demo);
+
+        let custom = Args::try_parse_from(["pane", "otheruser@otherhost", "--host-bin", "/opt/pane-host"]).unwrap();
+        assert!(!custom.demo);
+        assert_eq!(custom.target, "otheruser@otherhost");
+        assert_eq!(custom.host_bin, "/opt/pane-host");
+    }
 }

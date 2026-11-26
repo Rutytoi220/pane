@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use egui::{Color32, RichText, ScrollArea};
+use egui::{Color32, Layout, RichText, ScrollArea, TextWrapMode};
 use pane_proto::{ClientMsg, DirEntry};
 
 use crate::metrics::fmt_bytes;
@@ -155,59 +155,75 @@ impl FileExplorer {
     /// Render the File Explorer. Returns `Some(remote_path)` if the user
     /// clicked a file to preview in the syntax-styled File Viewer.
     pub fn show(&mut self, ui: &mut egui::Ui, out: &mut Vec<ClientMsg>) -> Option<String> {
+        // Never allow inner text or inputs to widen the docked SidePanel.
+        let panel_w = ui.available_width().max(120.0);
+        ui.set_max_width(panel_w);
+        ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
+
         let mut preview_target: Option<String> = None;
 
         // Navigation toolbar (pure ASCII labels to avoid missing glyph boxes).
-        ui.horizontal(|ui| {
-            if ui.button("Up").on_hover_text("Parent directory").clicked() {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if ui.small_button("Up").on_hover_text("Parent directory").clicked() {
                 let parent = parent_remote(&self.current_path);
                 self.request_dir(parent, out);
             }
-            if ui.button("~").on_hover_text("Home directory").clicked() {
+            if ui.small_button("~").on_hover_text("Home directory").clicked() {
                 self.request_dir("~", out);
             }
-            if ui.button("Refresh").on_hover_text("Reload listing").clicked() {
+            if ui.small_button("Refresh").on_hover_text("Reload listing").clicked() {
                 let cur = self.current_path.clone();
                 self.request_dir(cur, out);
             }
             let dock_label = if self.docked { "Float" } else { "Dock" };
-            if ui.button(dock_label).clicked() {
+            if ui.small_button(dock_label).clicked() {
                 self.docked = !self.docked;
             }
         });
 
-        // Editable path bar.
-        ui.horizontal(|ui| {
-            let resp = ui.add_sized(
-                [ui.available_width() - 36.0, 22.0],
-                egui::TextEdit::singleline(&mut self.path_input).font(egui::TextStyle::Monospace),
+        // Editable path bar with fixed-width container so it cannot grow the panel.
+        let mut submit_path = false;
+        ui.allocate_ui_with_layout(egui::vec2(panel_w, 22.0), Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("Go").clicked() {
+                submit_path = true;
+            }
+            let input_w = (ui.available_width() - 2.0).clamp(60.0, panel_w);
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.path_input)
+                    .desired_width(input_w)
+                    .font(egui::TextStyle::Monospace),
             );
-            let go = ui.button("Go").clicked()
-                || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-            if go {
-                let p = self.path_input.clone();
-                self.request_dir(p, out);
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                submit_path = true;
             }
         });
+        if submit_path {
+            let p = self.path_input.clone();
+            self.request_dir(p, out);
+        }
 
-        // Filter & hidden toggle.
-        ui.horizontal(|ui| {
-            ui.add_sized(
-                [ui.available_width() - 78.0, 20.0],
-                egui::TextEdit::singleline(&mut self.filter).hint_text("Filter..."),
-            );
+        // Filter & hidden toggle inside a fixed-width row.
+        ui.allocate_ui_with_layout(egui::vec2(panel_w, 22.0), Layout::right_to_left(egui::Align::Center), |ui| {
             ui.checkbox(&mut self.show_hidden, "Hidden");
+            let filter_w = (ui.available_width() - 2.0).clamp(60.0, panel_w);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.filter)
+                    .desired_width(filter_w)
+                    .hint_text("Filter..."),
+            );
         });
 
         if let Some(err) = &self.last_error {
-            ui.label(RichText::new(err).color(theme::ACCENT_CORAL).small());
+            ui.add(egui::Label::new(RichText::new(err).color(theme::ACCENT_CORAL).small()).wrap());
         }
 
-        // Active download progress bars.
+        // Active download progress bars (clamped to panel width).
         for dl in self.active_downloads.values() {
             let frac = if dl.total == 0 { 1.0 } else { (dl.received as f32 / dl.total as f32).clamp(0.0, 1.0) };
             ui.add(
                 egui::ProgressBar::new(frac)
+                    .desired_width(panel_w)
                     .text(format!(
                         "[DL] {} ({}/{})",
                         dl.filename,
@@ -220,16 +236,20 @@ impl FileExplorer {
 
         ui.separator();
 
-        // Directory listing.
+        // Vertical-only scrollable directory listing with strictly truncated filenames.
         let filter_lc = self.filter.to_lowercase();
         let mut nav_target: Option<String> = None;
         let mut dl_entry: Option<DirEntry> = None;
 
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let list_w = ui.available_width().max(100.0);
+            ui.set_max_width(list_w);
+
             if self.loading && self.entries.is_empty() {
                 ui.label(RichText::new("Loading...").color(theme::TEXT_MUTED));
                 return;
             }
+
             for entry in &self.entries {
                 if !self.show_hidden && entry.name.starts_with('.') {
                     continue;
@@ -237,49 +257,64 @@ impl FileExplorer {
                 if !filter_lc.is_empty() && !entry.name.to_lowercase().contains(&filter_lc) {
                     continue;
                 }
-                ui.horizontal(|ui| {
-                    let (tag, color) = if entry.is_dir {
-                        ("[DIR]", theme::ACCENT_CYAN)
-                    } else if entry.is_symlink {
-                        ("[LNK]", theme::ACCENT_VIOLET)
-                    } else {
-                        ("     ", theme::TEXT_MUTED)
-                    };
-                    ui.label(RichText::new(tag).monospace().size(10.5).color(color));
 
-                    let name_text = RichText::new(&entry.name)
-                        .monospace()
-                        .size(12.0)
-                        .color(if entry.is_dir { theme::TEXT_PRIMARY } else { Color32::from_rgb(196, 206, 220) });
-
-                    if entry.is_dir {
-                        if ui.selectable_label(false, name_text).clicked() {
-                            nav_target = Some(join_remote(&self.current_path, &entry.name));
-                        }
-                    } else {
+                ui.allocate_ui_with_layout(egui::vec2(list_w, 20.0), Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if !entry.is_dir {
                         if ui
-                            .selectable_label(false, name_text)
-                            .on_hover_text("Click to inspect in File Viewer")
+                            .small_button("[DL]")
+                            .on_hover_text("Download to ~/Downloads")
                             .clicked()
                         {
-                            preview_target = Some(join_remote(&self.current_path, &entry.name));
+                            dl_entry = Some(entry.clone());
                         }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .small_button("[DL]")
-                                .on_hover_text("Download to ~/Downloads")
+                        ui.label(
+                            RichText::new(fmt_bytes(entry.size as f64))
+                                .monospace()
+                                .size(10.5)
+                                .color(theme::TEXT_MUTED),
+                        );
+                    }
+
+                    let name_area_w = ui.available_width().max(40.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(name_area_w, 20.0),
+                        Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let (tag, color) = if entry.is_dir {
+                                ("[DIR]", theme::ACCENT_CYAN)
+                            } else if entry.is_symlink {
+                                ("[LNK]", theme::ACCENT_VIOLET)
+                            } else {
+                                ("     ", theme::TEXT_MUTED)
+                            };
+                            ui.label(RichText::new(tag).monospace().size(10.5).color(color));
+
+                            let name_text = RichText::new(&entry.name)
+                                .monospace()
+                                .size(12.0)
+                                .color(if entry.is_dir {
+                                    theme::TEXT_PRIMARY
+                                } else {
+                                    Color32::from_rgb(196, 206, 220)
+                                });
+
+                            let btn = egui::Button::selectable(false, name_text)
+                                .wrap_mode(TextWrapMode::Truncate);
+                            if entry.is_dir {
+                                if ui.add(btn).on_hover_text(&entry.name).clicked() {
+                                    nav_target = Some(join_remote(&self.current_path, &entry.name));
+                                }
+                            } else if ui
+                                .add(btn)
+                                .on_hover_text(format!("{} (click to inspect)", entry.name))
                                 .clicked()
                             {
-                                dl_entry = Some(entry.clone());
+                                preview_target = Some(join_remote(&self.current_path, &entry.name));
                             }
-                            ui.label(
-                                RichText::new(fmt_bytes(entry.size as f64))
-                                    .monospace()
-                                    .size(10.5)
-                                    .color(theme::TEXT_MUTED),
-                            );
-                        });
-                    }
+                        },
+                    );
                 });
             }
         });
@@ -293,13 +328,19 @@ impl FileExplorer {
 
         if !self.recent_downloads.is_empty() {
             ui.separator();
-            ui.label(RichText::new("Recent downloads (~/Downloads)").small().color(theme::TEXT_MUTED));
+            ui.add(
+                egui::Label::new(RichText::new("Recent downloads (~/Downloads)").small().color(theme::TEXT_MUTED))
+                    .wrap_mode(TextWrapMode::Truncate),
+            );
             for d in &self.recent_downloads {
-                ui.label(
-                    RichText::new(format!("[OK] {} ({})", d.filename, fmt_bytes(d.bytes as f64)))
-                        .monospace()
-                        .size(11.0)
-                        .color(theme::ACCENT_GREEN),
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("[OK] {} ({})", d.filename, fmt_bytes(d.bytes as f64)))
+                            .monospace()
+                            .size(11.0)
+                            .color(theme::ACCENT_GREEN),
+                    )
+                    .wrap_mode(TextWrapMode::Truncate),
                 )
                 .on_hover_text(d.dest_path.display().to_string());
             }

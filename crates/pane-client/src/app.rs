@@ -53,6 +53,8 @@ pub struct PaneApp {
 
     /// Workspace rect captured from `CentralPanel` each frame.
     workspace_rect: Rect,
+    /// True once the first `CentralPanel` pass has measured the real workspace rect.
+    layout_ready: bool,
     /// Active floating window key (highlighted in taskbar).
     active_window: Option<WinKey>,
     /// Last rendered `LayerId` per floating window so taskbar clicks can raise it.
@@ -83,6 +85,7 @@ impl PaneApp {
             monitor: SystemMonitor::new(),
             processes: ProcessManager::new(),
             workspace_rect: Rect::from_min_size(Pos2::new(270.0, 36.0), Vec2::new(880.0, 780.0)),
+            layout_ready: false,
             active_window: None,
             window_layers: HashMap::new(),
             pending_tiles: HashMap::new(),
@@ -520,14 +523,23 @@ impl eframe::App for PaneApp {
         self.show_hud(ui);
         self.show_taskbar(ui, &ctx, &mut outgoing);
 
+        // Clamp each docked side panel to at most 32% of the total viewport width
+        // so CentralPanel always retains at least 36% of the screen.
+        let viewport_w = ui.available_width().max(640.0);
+        let max_dock_w = (viewport_w * 0.32).max(200.0);
+
         // 2. Docked File Explorer (left).
         if self.files.open && self.files.docked {
+            let min_w = 180.0_f32.min(max_dock_w);
+            let def_w = 270.0_f32.clamp(min_w, max_dock_w);
             Panel::left("files_dock")
                 .resizable(true)
-                .default_size(270.0)
-                .min_size(210.0)
+                .default_size(def_w)
+                .min_size(min_w)
+                .max_size(max_dock_w)
                 .frame(panel_frame())
                 .show(ui, |ui| {
+                    ui.set_max_width(ui.available_width());
                     ui.label(RichText::new("REMOTE FILES").small().strong().color(theme::TEXT_MUTED));
                     if let Some(path) = self.files.show(ui, &mut outgoing) {
                         preview_requests.push(path);
@@ -537,12 +549,16 @@ impl eframe::App for PaneApp {
 
         // 3. Docked System Monitor (right).
         if self.monitor.open && self.monitor.docked {
+            let min_w = 200.0_f32.min(max_dock_w);
+            let def_w = 285.0_f32.clamp(min_w, max_dock_w);
             Panel::right("monitor_dock")
                 .resizable(true)
-                .default_size(285.0)
-                .min_size(230.0)
+                .default_size(def_w)
+                .min_size(min_w)
+                .max_size(max_dock_w)
                 .frame(panel_frame())
                 .show(ui, |ui| {
+                    ui.set_max_width(ui.available_width());
                     ui.label(RichText::new("SYSTEM MONITOR").small().strong().color(theme::TEXT_MUTED));
                     self.monitor.show(ui, self.host.as_ref(), &self.telemetry, &self.metrics);
                 });
@@ -600,6 +616,19 @@ impl eframe::App for PaneApp {
                 }
             });
         self.workspace_rect = workspace_rect;
+        if !self.layout_ready {
+            // Wait one frame after measuring the real CentralPanel rect before
+            // placing initial floating windows so they anchor cleanly with zero jump.
+            self.layout_ready = true;
+            for path in preview_requests {
+                self.open_file_viewer(&ctx, path, &mut outgoing);
+            }
+            for msg in outgoing {
+                self.send(msg);
+            }
+            ctx.request_repaint();
+            return;
+        }
 
         for path in preview_requests {
             self.open_file_viewer(&ctx, path, &mut outgoing);

@@ -80,10 +80,18 @@ cargo run --bin pane -- --demo
 
 ### Connect to Any Headless x86_64 Linux Host over SSH (Zero-Config)
 
-No pre-installation required on the server — `pane` embeds the static musl `pane-host` binary and automatically uploads it once to `~/.cache/pane/pane-host-0.1.0` over SSH before launching the session:
+No pre-installation required on the server — `pane` embeds the static musl `pane-host` binary and automatically uploads it once to `~/.cache/pane/pane-host-0.1.0` over SSH before launching the session.
+
+Running `pane` with no arguments connects to the default target (`rutytoi@100.100.33.5`):
 
 ```bash
-./target/release/pane user@host
+./target/release/pane
+```
+
+Or specify any other SSH target explicitly:
+
+```bash
+./target/release/pane otheruser@otherhost
 ```
 
 To skip auto-deploy and execute a custom remote binary path instead, pass `--host-bin`:
