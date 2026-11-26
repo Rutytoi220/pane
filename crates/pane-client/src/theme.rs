@@ -65,6 +65,13 @@ pub fn install(ctx: &egui::Context) {
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(8.0, 3.0);
     ctx.set_global_style(style);
+
+    // Prevent egui from hijacking Ctrl+Q (quit) and Ctrl++/Ctrl+- (GUI zoom)
+    // so terminal shortcuts like Ctrl+Q, Ctrl+C, Ctrl+X, Ctrl+- pass through cleanly.
+    ctx.options_mut(|o| {
+        o.quit_shortcuts.clear();
+        o.zoom_with_keyboard = false;
+    });
 }
 
 /// Resolve a protocol [`Color`] into a concrete `Color32`.

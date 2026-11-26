@@ -250,6 +250,9 @@ impl PaneApp {
         self.active_window = Some(key);
         if let WinKey::Terminal(id) = key {
             self.focused_term = Some(id);
+            if let Some(t) = self.terminals.iter_mut().find(|t| t.id == id) {
+                t.want_focus = true;
+            }
         } else {
             self.focused_term = None;
         }

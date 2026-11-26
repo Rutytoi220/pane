@@ -1,8 +1,8 @@
 //! GPU-rendered terminal viewport: draws retained `pane_proto::Screen` state
-//! directly via egui's tessellator and converts keyboard/scroll/resize events
-//! back into `ClientMsg` commands.
+//! directly via egui's tessellator and converts keyboard/shortcut/paste/scroll/
+//! resize events back into `ClientMsg` commands.
 
-use egui::{Align2, Color32, Event, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use egui::{Align2, Color32, Event, EventFilter, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use pane_proto::{ClientMsg, Screen, StyleFlags};
 
 use crate::theme;
@@ -17,6 +17,7 @@ pub struct TerminalPane {
     pub closed: bool,
     pub exit_code: Option<u32>,
     pub open: bool,
+    pub want_focus: bool,
     last_sent_size: (u16, u16),
 }
 
@@ -30,6 +31,7 @@ impl TerminalPane {
             closed: false,
             exit_code: None,
             open: true,
+            want_focus: true,
             last_sent_size: (cols, rows),
         }
     }
@@ -58,6 +60,23 @@ pub fn show_terminal(
 
     if resp.clicked() {
         clicked = true;
+        term.want_focus = true;
+    }
+
+    // Properly acquire egui widget focus when active so TextEdits release focus
+    // and Tab/Esc/Arrow keys stay locked inside the terminal instead of moving UI focus.
+    if term.want_focus || (focused && !resp.has_focus() && !ui.ctx().egui_wants_keyboard_input()) {
+        resp.request_focus();
+        term.want_focus = false;
+    }
+    let active_kbd = focused && !term.closed && (resp.has_focus() || !ui.ctx().egui_wants_keyboard_input());
+    if active_kbd && resp.has_focus() {
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                resp.id,
+                EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true },
+            );
+        });
     }
 
     // Dynamic grid resize when the window is resized.
@@ -81,36 +100,28 @@ pub fn show_terminal(
         }
     }
 
-    // Keyboard & paste input when focused.
-    if focused && !term.closed {
+    // Keyboard, shortcut & paste input when this terminal has keyboard focus.
+    // We consume handled events so egui never double-triggers buttons or quit/zoom shortcuts.
+    if active_kbd {
         let mut bytes = Vec::new();
+        let mut copy_screen = false;
         let app_cursor = term.screen.app_cursor;
         let bracketed = term.screen.bracketed_paste;
-        ui.input(|i| {
-            for ev in &i.events {
-                match ev {
-                    Event::Text(s) => {
-                        // Ctrl combinations are translated via Event::Key below.
-                        if !i.modifiers.ctrl && !i.modifiers.command {
-                            bytes.extend_from_slice(s.as_bytes());
-                        }
-                    }
-                    Event::Paste(s) => {
-                        if bracketed {
-                            bytes.extend_from_slice(b"\x1b[200~");
-                            bytes.extend_from_slice(s.as_bytes());
-                            bytes.extend_from_slice(b"\x1b[201~");
-                        } else {
-                            bytes.extend_from_slice(s.as_bytes());
-                        }
-                    }
-                    Event::Key { key, pressed: true, modifiers, .. } => {
-                        encode_key(*key, *modifiers, app_cursor, &mut bytes);
-                    }
-                    _ => {}
+
+        ui.input_mut(|i| {
+            let cur_mods = i.modifiers;
+            i.events.retain(|ev| {
+                let outcome = translate_event(ev, cur_mods, app_cursor, bracketed, &mut bytes);
+                if outcome.copy_screen {
+                    copy_screen = true;
                 }
-            }
+                !outcome.consumed
+            });
         });
+
+        if copy_screen {
+            ui.ctx().copy_text(term.screen.text());
+        }
         if !bytes.is_empty() {
             out.push(ClientMsg::TermInput { term_id: term.id, data: bytes });
         }
@@ -119,7 +130,7 @@ pub fn show_terminal(
     // Paint background & border.
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 3.0, theme::TERM_DEFAULT_BG);
-    let border = if focused { theme::BORDER_FOCUS } else { theme::BORDER };
+    let border = if active_kbd { theme::BORDER_FOCUS } else { theme::BORDER };
     painter.rect_stroke(rect, 3.0, Stroke::new(1.0, border), StrokeKind::Inside);
 
     // Paint every visible row from the retained Screen mirror.
@@ -163,7 +174,7 @@ pub fn show_terminal(
         let cx = origin.x + term.screen.cursor_col as f32 * cell_w;
         let cy = origin.y + term.screen.cursor_row as f32 * cell_h;
         let cur_rect = Rect::from_min_size(Pos2::new(cx, cy), Vec2::new(cell_w, cell_h));
-        if focused {
+        if active_kbd {
             painter.rect_filled(cur_rect, 1.0, Color32::from_rgba_unmultiplied(56, 189, 248, 175));
         } else {
             painter.rect_stroke(cur_rect, 1.0, Stroke::new(1.0, theme::ACCENT_CYAN), StrokeKind::Inside);
@@ -187,58 +198,128 @@ pub fn show_terminal(
     clicked
 }
 
+struct EventOutcome {
+    consumed: bool,
+    copy_screen: bool,
+}
+
+fn translate_event(
+    ev: &Event,
+    cur_mods: Modifiers,
+    app_cursor: bool,
+    bracketed: bool,
+    out: &mut Vec<u8>,
+) -> EventOutcome {
+    match ev {
+        // egui-winit converts Ctrl+C -> Event::Copy and Ctrl+X -> Event::Cut before
+        // emitting Event::Key. Inside a terminal, those must deliver SIGINT (^C) and ^X!
+        Event::Copy => {
+            out.push(0x03);
+            EventOutcome { consumed: true, copy_screen: false }
+        }
+        Event::Cut => {
+            out.push(0x18);
+            EventOutcome { consumed: true, copy_screen: false }
+        }
+        Event::Paste(s) => {
+            if bracketed {
+                out.extend_from_slice(b"\x1b[200~");
+                out.extend_from_slice(s.as_bytes());
+                out.extend_from_slice(b"\x1b[201~");
+            } else {
+                out.extend_from_slice(s.as_bytes());
+            }
+            EventOutcome { consumed: true, copy_screen: false }
+        }
+        Event::Text(s) => {
+            if !cur_mods.ctrl && !cur_mods.command && !cur_mods.alt {
+                out.extend_from_slice(s.as_bytes());
+                EventOutcome { consumed: true, copy_screen: false }
+            } else {
+                EventOutcome { consumed: false, copy_screen: false }
+            }
+        }
+        Event::Key { key, pressed: true, modifiers, .. } => {
+            // Ctrl+Shift+C copies the visible terminal buffer to clipboard.
+            if (modifiers.ctrl || modifiers.command) && modifiers.shift && !modifiers.alt && *key == Key::C {
+                return EventOutcome { consumed: true, copy_screen: true };
+            }
+            let before = out.len();
+            encode_key(*key, *modifiers, app_cursor, out);
+            EventOutcome { consumed: out.len() > before, copy_screen: false }
+        }
+        _ => EventOutcome { consumed: false, copy_screen: false },
+    }
+}
+
 fn encode_key(key: Key, m: Modifiers, app_cursor: bool, out: &mut Vec<u8>) {
-    // Ctrl+A..Z control codes (unless Shift is held for e.g. Ctrl+Shift+C).
-    if m.ctrl && !m.alt && !m.shift {
-        if let Some(ctrl_byte) = ctrl_letter(key) {
-            out.push(ctrl_byte);
+    let ctrl = m.ctrl || m.command;
+
+    // Ctrl + key control codes (Ctrl+A..Z, Ctrl+[, Ctrl+\, Ctrl+], Ctrl+^, Ctrl+_, Ctrl+2).
+    if ctrl && !m.shift {
+        let ctrl_byte = ctrl_letter(key).or(match key {
+            Key::OpenBracket => Some(0x1b),
+            Key::Backslash => Some(0x1c),
+            Key::CloseBracket => Some(0x1d),
+            Key::Num6 => Some(0x1e),
+            Key::Minus | Key::Slash => Some(0x1f),
+            Key::Space | Key::Num2 => Some(0x00),
+            Key::Backspace => Some(0x08),
+            _ => None,
+        });
+        if let Some(b) = ctrl_byte {
+            if m.alt {
+                out.push(0x1b);
+            }
+            out.push(b);
+            return;
+        }
+    }
+
+    // Alt + ASCII letter / Enter / Backspace -> Meta ESC prefix (bash/zsh/emacs/nano).
+    if m.alt && !ctrl {
+        if let Some(ch) = key_to_ascii_letter(key) {
+            out.push(0x1b);
+            out.push(if m.shift { ch } else { ch.to_ascii_lowercase() });
             return;
         }
         match key {
-            Key::OpenBracket => {
-                out.push(0x1b);
+            Key::Backspace => {
+                out.extend_from_slice(b"\x1b\x7f");
                 return;
             }
-            Key::Backslash => {
-                out.push(0x1c);
-                return;
-            }
-            Key::CloseBracket => {
-                out.push(0x1d);
-                return;
-            }
-            Key::Space => {
-                out.push(0x00);
+            Key::Enter => {
+                out.extend_from_slice(b"\x1b\r");
                 return;
             }
             _ => {}
         }
     }
 
-    let csi_prefix: &[u8] = if app_cursor { b"\x1bO" } else { b"\x1b[" };
+    // Xterm modifier parameter for arrows / Home / End / Insert / Delete / PageUp / PageDown.
+    let mod_param = 1 + u8::from(m.shift) + 2 * u8::from(m.alt) + 4 * u8::from(ctrl);
+    let csi_prefix: &[u8] = if app_cursor && mod_param == 1 { b"\x1bO" } else { b"\x1b[" };
+
+    let push_modified_csi = |final_byte: u8, out: &mut Vec<u8>| {
+        if mod_param == 1 {
+            out.extend_from_slice(csi_prefix);
+            out.push(final_byte);
+        } else {
+            out.extend_from_slice(format!("\x1b[1;{mod_param}{}", final_byte as char).as_bytes());
+        }
+    };
+
     match key {
         Key::Enter => out.push(b'\r'),
         Key::Backspace => out.push(0x7f),
         Key::Tab => out.extend_from_slice(if m.shift { b"\x1b[Z" } else { b"\t" }),
         Key::Escape => out.push(0x1b),
-        Key::ArrowUp => {
-            out.extend_from_slice(csi_prefix);
-            out.push(b'A');
-        }
-        Key::ArrowDown => {
-            out.extend_from_slice(csi_prefix);
-            out.push(b'B');
-        }
-        Key::ArrowRight => {
-            out.extend_from_slice(csi_prefix);
-            out.push(b'C');
-        }
-        Key::ArrowLeft => {
-            out.extend_from_slice(csi_prefix);
-            out.push(b'D');
-        }
-        Key::Home => out.extend_from_slice(b"\x1b[H"),
-        Key::End => out.extend_from_slice(b"\x1b[F"),
+        Key::ArrowUp => push_modified_csi(b'A', out),
+        Key::ArrowDown => push_modified_csi(b'B', out),
+        Key::ArrowRight => push_modified_csi(b'C', out),
+        Key::ArrowLeft => push_modified_csi(b'D', out),
+        Key::Home => push_modified_csi(b'H', out),
+        Key::End => push_modified_csi(b'F', out),
         Key::PageUp => out.extend_from_slice(b"\x1b[5~"),
         Key::PageDown => out.extend_from_slice(b"\x1b[6~"),
         Key::Insert => out.extend_from_slice(b"\x1b[2~"),
@@ -260,7 +341,11 @@ fn encode_key(key: Key, m: Modifiers, app_cursor: bool, out: &mut Vec<u8>) {
 }
 
 fn ctrl_letter(key: Key) -> Option<u8> {
-    let ch = match key {
+    key_to_ascii_letter(key).map(|ch| ch - b'A' + 1)
+}
+
+fn key_to_ascii_letter(key: Key) -> Option<u8> {
+    Some(match key {
         Key::A => b'A',
         Key::B => b'B',
         Key::C => b'C',
@@ -288,6 +373,45 @@ fn ctrl_letter(key: Key) -> Option<u8> {
         Key::Y => b'Y',
         Key::Z => b'Z',
         _ => return None,
-    };
-    Some(ch - b'A' + 1)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key_event(key: Key, modifiers: Modifiers) -> Event {
+        Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    #[test]
+    fn translates_ctrl_c_ctrl_x_ctrl_q_and_ctrl_arrows() {
+        let mut out = Vec::new();
+        // Ctrl+C arrives from egui-winit as Event::Copy.
+        assert!(translate_event(&Event::Copy, Modifiers::CTRL, false, false, &mut out).consumed);
+        // Ctrl+X arrives from egui-winit as Event::Cut.
+        assert!(translate_event(&Event::Cut, Modifiers::CTRL, false, false, &mut out).consumed);
+        // Ctrl+Q arrives as Key::Q with CTRL|COMMAND.
+        let ctrl_cmd = Modifiers { ctrl: true, command: true, ..Default::default() };
+        assert!(translate_event(&key_event(Key::Q, ctrl_cmd), ctrl_cmd, false, false, &mut out).consumed);
+        assert!(translate_event(&key_event(Key::D, ctrl_cmd), ctrl_cmd, false, false, &mut out).consumed);
+        assert_eq!(out, vec![0x03, 0x18, 0x11, 0x04]);
+
+        // Ctrl+Right sends xterm modifier CSI sequence.
+        let mut nav = Vec::new();
+        assert!(translate_event(&key_event(Key::ArrowRight, ctrl_cmd), ctrl_cmd, false, false, &mut nav).consumed);
+        assert_eq!(nav, b"\x1b[1;5C");
+
+        // Alt+B sends ESC b.
+        let mut meta = Vec::new();
+        assert!(translate_event(&key_event(Key::B, Modifiers::ALT), Modifiers::ALT, false, false, &mut meta).consumed);
+        assert_eq!(meta, b"\x1bb");
+
+        // Ctrl+Shift+C triggers screen copy rather than sending bytes.
+        let mut cp = Vec::new();
+        let ctrl_shift = Modifiers { ctrl: true, command: true, shift: true, ..Default::default() };
+        let res = translate_event(&key_event(Key::C, ctrl_shift), ctrl_shift, false, false, &mut cp);
+        assert!(res.consumed && res.copy_screen);
+        assert!(cp.is_empty());
+    }
 }
