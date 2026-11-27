@@ -12,3 +12,5 @@ portable-pty.workspace = true
 vt100.workspace = true
 crossbeam-channel.workspace = true
 libc.workspace = true
+lz4_flex.workspace = true
+x11rb.workspace = true

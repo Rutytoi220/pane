@@ -1911,6 +1911,7 @@ dependencies = [
  "dirs",
  "eframe",
  "egui",
+ "lz4_flex",
  "pane-proto",
 ]
 
@@ -1920,9 +1921,11 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "libc",
+ "lz4_flex",
  "pane-proto",
  "portable-pty",
  "vt100",
+ "x11rb",
 ]
 
 [[package]]

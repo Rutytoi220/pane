@@ -16,6 +16,7 @@ macro_rules! log {
 }
 
 mod files;
+mod gui_bridge;
 mod outbox;
 mod processes;
 mod services;
@@ -53,6 +54,7 @@ fn main() {
 
     let outbox = Outbox::spawn(io::stdout());
     let terminals = TerminalManager::spawn(outbox.clone());
+    let gui = gui_bridge::GuiBridge::spawn(outbox.clone());
     let mut proc_mon = processes::ProcessMonitor::new();
     let mut telemetry_started = false;
 
@@ -156,9 +158,19 @@ fn main() {
             ClientMsg::ControlContainer { req_id, id, action } => {
                 services::spawn_control_container(req_id, id, action, outbox.clone());
             }
+            ClientMsg::LaunchGuiApp { req_id, command } => gui.launch(req_id, command),
+            ClientMsg::GuiMouseMove { win_id, x, y } => gui.mouse_move(win_id, x, y),
+            ClientMsg::GuiMouseButton { win_id, button, pressed, x, y } => {
+                gui.mouse_button(win_id, button, pressed, x, y);
+            }
+            ClientMsg::GuiScroll { win_id, delta_y, x, y } => gui.scroll(win_id, delta_y, x, y),
+            ClientMsg::GuiKey { win_id, keysym, pressed } => gui.key(win_id, keysym, pressed),
+            ClientMsg::CloseGuiWindow { win_id } => gui.close_window(win_id),
+            ClientMsg::SetGuiWindowActive { win_id, active } => gui.set_active(win_id, active),
         }
     }
 
+    gui.shutdown();
     terminals.shutdown();
     outbox.shutdown();
 }

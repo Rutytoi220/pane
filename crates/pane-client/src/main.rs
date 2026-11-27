@@ -2,6 +2,7 @@
 
 mod app;
 mod files_view;
+mod gui_window_view;
 mod launcher;
 mod metrics;
 mod monitor_view;

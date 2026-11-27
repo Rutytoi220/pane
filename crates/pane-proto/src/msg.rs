@@ -50,6 +50,21 @@ pub enum ClientMsg {
     ControlService { req_id: u64, name: String, action: ServiceAction },
     /// Restart, stop, or start a Docker container by ID or name.
     ControlContainer { req_id: u64, id: String, action: ServiceAction },
+
+    /// Launch a remote X11 GUI application inside the headless Xvfb bridge.
+    LaunchGuiApp { req_id: u64, command: String },
+    /// Move pointer relative to a streamed GUI window's top-left corner.
+    GuiMouseMove { win_id: u32, x: i16, y: i16 },
+    /// Press or release a mouse button (`1`=left, `2`=middle, `3`=right).
+    GuiMouseButton { win_id: u32, button: u8, pressed: bool, x: i16, y: i16 },
+    /// Scroll wheel event (`delta_y > 0` = scroll up / button 4, `< 0` = down / button 5).
+    GuiScroll { win_id: u32, delta_y: i16, x: i16, y: i16 },
+    /// Key press or release identified by X11 keysym.
+    GuiKey { win_id: u32, keysym: u32, pressed: bool },
+    /// Request closing a streamed GUI window (`WM_DELETE_WINDOW` / destroy).
+    CloseGuiWindow { win_id: u32 },
+    /// Pause or resume XDamage capture (e.g. when switching virtual workspaces).
+    SetGuiWindowActive { win_id: u32, active: bool },
 }
 
 /// Messages sent from the remote headless host to the local GPU client.
@@ -125,6 +140,15 @@ pub enum HostMsg {
     },
     /// Reply to [`ClientMsg::ControlService`] or [`ClientMsg::ControlContainer`].
     ControlResult { req_id: u64, target: String, ok: bool, message: String },
+
+    /// A top-level GUI window was mapped on the host's headless Xvfb server.
+    GuiWindowOpened { win_id: u32, title: String, width: u16, height: u16 },
+    /// A streamed GUI window changed dimensions.
+    GuiWindowResized { win_id: u32, width: u16, height: u16 },
+    /// LZ4-compressed RGBA pixel patch for a damaged sub-rectangle of a GUI window.
+    GuiWindowDamage { win_id: u32, x: u16, y: u16, width: u16, height: u16, rgba_lz4: Vec<u8> },
+    /// A streamed GUI window was unmapped or destroyed.
+    GuiWindowClosed { win_id: u32 },
 }
 
 /// Summary of one remote process from `/proc`.

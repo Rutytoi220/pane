@@ -17,7 +17,10 @@ pub enum LauncherAction {
     ToggleMonitor,
     OpenServices,
     TileWindows,
-    RunRemoteGui(String),
+    /// Launch a remote X11 GUI app seamlessly inside `pane` via Xvfb + XDamage.
+    LaunchEmbeddedGui(String),
+    /// Launch a remote GUI app externally via `waypipe ssh` / `ssh -Y`.
+    RunExternalGui(String),
 }
 
 struct NativeAppItem {
@@ -76,12 +79,13 @@ const GUI_PRESETS: &[(&str, &str)] = &[
 pub struct AppLauncher {
     pub open: bool,
     pub query: String,
+    pub use_external_waypipe: bool,
     just_opened: bool,
 }
 
 impl AppLauncher {
     pub fn new() -> Self {
-        Self { open: false, query: String::new(), just_opened: false }
+        Self { open: false, query: String::new(), use_external_waypipe: false, just_opened: false }
     }
 
     pub fn toggle(&mut self) {
@@ -185,33 +189,50 @@ impl AppLauncher {
 
                         ui.add_space(8.0);
                         ui.separator();
-                        ui.label(
-                            RichText::new("REMOTE GUI APPS OVER SSH (waypipe -> ssh -Y fallback)")
-                                .small()
-                                .strong()
-                                .color(theme::ACCENT_GREEN),
-                        );
+                        ui.horizontal(|ui| {
+                            let mode_label = if self.use_external_waypipe {
+                                "REMOTE GUI APPS (external waypipe / ssh -Y)"
+                            } else {
+                                "REMOTE GUI APPS (native seamless inside pane via Xvfb)"
+                            };
+                            ui.label(RichText::new(mode_label).small().strong().color(theme::ACCENT_GREEN));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.checkbox(&mut self.use_external_waypipe, "External waypipe");
+                            });
+                        });
+
+                        let make_gui_action = |cmd: String, external: bool| {
+                            if external {
+                                LauncherAction::RunExternalGui(cmd)
+                            } else {
+                                LauncherAction::LaunchEmbeddedGui(cmd)
+                            }
+                        };
 
                         if !q.is_empty() {
-                            let cmd_text = format!("[GUI] Run `{q}` on remote host");
+                            let cmd_text = if self.use_external_waypipe {
+                                format!("[WAYPIPE] Run `{q}` externally")
+                            } else {
+                                format!("[APP] Launch `{q}` inside pane")
+                            };
                             if ui
                                 .button(RichText::new(cmd_text).monospace().color(theme::ACCENT_GREEN))
                                 .clicked()
                             {
-                                chosen = Some(LauncherAction::RunRemoteGui(q.to_owned()));
+                                chosen = Some(make_gui_action(q.to_owned(), self.use_external_waypipe));
                             }
                             if first_match.is_none() {
-                                first_match = Some(LauncherAction::RunRemoteGui(q.to_owned()));
+                                first_match = Some(make_gui_action(q.to_owned(), self.use_external_waypipe));
                             }
                         } else {
                             ui.horizontal_wrapped(|ui| {
                                 for &(cmd, desc) in GUI_PRESETS {
                                     if ui
-                                        .button(RichText::new(format!("[GUI] {cmd}")).monospace())
+                                        .button(RichText::new(format!("[APP] {cmd}")).monospace())
                                         .on_hover_text(desc)
                                         .clicked()
                                     {
-                                        chosen = Some(LauncherAction::RunRemoteGui(cmd.to_owned()));
+                                        chosen = Some(make_gui_action(cmd.to_owned(), self.use_external_waypipe));
                                     }
                                 }
                             });

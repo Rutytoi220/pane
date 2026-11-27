@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 pane-proto.workspace = true
 crossbeam-channel.workspace = true
+lz4_flex.workspace = true
 clap.workspace = true
 dirs.workspace = true
 anyhow.workspace = true

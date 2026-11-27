@@ -17,6 +17,7 @@ use egui::{CentralPanel, Color32, Frame, Key, LayerId, Margin, Panel, Pos2, Rect
 use pane_proto::{ClientMsg, HostMsg, PROTOCOL_VERSION};
 
 use crate::files_view::FileExplorer;
+use crate::gui_window_view::{GuiWindowPane, show_gui_window};
 use crate::launcher::{AppLauncher, LauncherAction, spawn_remote_gui_app};
 use crate::metrics::{SessionMetrics, fmt_bytes};
 use crate::monitor_view::{HostInfo, SystemMonitor, TelemetryState};
@@ -33,6 +34,7 @@ const PING_INTERVAL: Duration = Duration::from_secs(1);
 enum WinKey {
     Terminal(u32),
     Viewer(u64),
+    GuiApp(u32),
     Processes,
     Services,
     Files,
@@ -59,6 +61,7 @@ pub struct PaneApp {
 
     viewers: Vec<FileViewerPane>,
     next_viewer_id: u64,
+    gui_windows: Vec<GuiWindowPane>,
     next_aux_req_id: u64,
 
     files: FileExplorer,
@@ -99,6 +102,7 @@ impl PaneApp {
             focused_term: None,
             viewers: Vec::new(),
             next_viewer_id: 1,
+            gui_windows: Vec::new(),
             next_aux_req_id: 100_000,
             files: FileExplorer::new(),
             files_workspace: 1,
@@ -156,6 +160,7 @@ impl PaneApp {
     fn workspace_window_count(&self, ws: u8) -> usize {
         let mut n = self.terminals.iter().filter(|t| t.open && t.workspace == ws).count();
         n += self.viewers.iter().filter(|v| v.open && v.workspace == ws).count();
+        n += self.gui_windows.iter().filter(|g| g.open && g.workspace == ws).count();
         if self.processes.open && self.processes.workspace == ws {
             n += 1;
         }
@@ -182,6 +187,11 @@ impl PaneApp {
         for v in &self.viewers {
             if v.open && v.workspace == ws {
                 keys.push(WinKey::Viewer(v.id));
+            }
+        }
+        for g in &self.gui_windows {
+            if g.open && g.workspace == ws {
+                keys.push(WinKey::GuiApp(g.id));
             }
         }
         if self.processes.open && self.processes.workspace == ws {
@@ -255,6 +265,11 @@ impl PaneApp {
             }
         } else {
             self.focused_term = None;
+            if let WinKey::GuiApp(id) = key
+                && let Some(g) = self.gui_windows.iter_mut().find(|g| g.id == id)
+            {
+                g.want_focus = true;
+            }
         }
         if let Some(&layer_id) = self.window_layers.get(&key) {
             ctx.move_to_top(layer_id);
@@ -285,14 +300,19 @@ impl PaneApp {
             }
             LauncherAction::OpenServices => self.open_services(ctx, out),
             LauncherAction::TileWindows => self.trigger_tile(),
-            LauncherAction::RunRemoteGui(cmd) => {
+            LauncherAction::LaunchEmbeddedGui(cmd) => {
+                let req_id = self.alloc_aux_req_id();
+                self.notify(format!("Launching `{cmd}` inside pane (Xvfb)..."), theme::ACCENT_CYAN);
+                out.push(ClientMsg::LaunchGuiApp { req_id, command: cmd });
+            }
+            LauncherAction::RunExternalGui(cmd) => {
                 let notice = spawn_remote_gui_app(&self.mode, cmd);
                 self.notify(notice, theme::ACCENT_GREEN);
             }
         }
     }
 
-    fn poll_transport(&mut self) {
+    fn poll_transport(&mut self, ctx: &egui::Context) {
         let mut outgoing = Vec::new();
         let events: Vec<TransportEvent> = self
             .transport
@@ -315,7 +335,7 @@ impl PaneApp {
                 }
                 TransportEvent::Msg { msg, wire_bytes } => {
                     self.metrics.record_rx(wire_bytes);
-                    self.handle_host_msg(msg, &mut outgoing);
+                    self.handle_host_msg(ctx, msg, &mut outgoing);
                 }
             }
         }
@@ -347,7 +367,7 @@ impl PaneApp {
         self.metrics.tick();
     }
 
-    fn handle_host_msg(&mut self, msg: HostMsg, out: &mut Vec<ClientMsg>) {
+    fn handle_host_msg(&mut self, ctx: &egui::Context, msg: HostMsg, out: &mut Vec<ClientMsg>) {
         match msg {
             HostMsg::Welcome { hostname, os_info, cpu_cores, total_mem_mb, home_dir, .. } => {
                 self.host = Some(HostInfo { hostname, os_info, cpu_cores, total_mem_mb });
@@ -425,6 +445,35 @@ impl PaneApp {
             HostMsg::ControlResult { ok, message, .. } => {
                 self.services.on_control_result(ok, message.clone());
                 self.notify(message, if ok { theme::ACCENT_GREEN } else { theme::ACCENT_CORAL });
+            }
+            HostMsg::GuiWindowOpened { win_id, title, width, height } => {
+                if let Some(existing) = self.gui_windows.iter_mut().find(|g| g.id == win_id) {
+                    existing.title = title;
+                    existing.open = true;
+                    existing.apply_resize(ctx, width, height);
+                } else {
+                    self.gui_windows.push(GuiWindowPane::new(win_id, self.active_workspace, title, width, height));
+                }
+                self.active_window = Some(WinKey::GuiApp(win_id));
+                self.focused_term = None;
+            }
+            HostMsg::GuiWindowResized { win_id, width, height } => {
+                if let Some(g) = self.gui_windows.iter_mut().find(|g| g.id == win_id) {
+                    g.apply_resize(ctx, width, height);
+                }
+            }
+            HostMsg::GuiWindowDamage { win_id, x, y, width, height, rgba_lz4 } => {
+                if let Some(g) = self.gui_windows.iter_mut().find(|g| g.id == win_id) {
+                    g.apply_damage(ctx, x, y, width, height, &rgba_lz4);
+                }
+            }
+            HostMsg::GuiWindowClosed { win_id } => {
+                self.gui_windows.retain(|g| g.id != win_id);
+                self.window_layers.remove(&WinKey::GuiApp(win_id));
+                self.last_applied_tile_epoch.remove(&WinKey::GuiApp(win_id));
+                if self.active_window == Some(WinKey::GuiApp(win_id)) {
+                    self.active_window = None;
+                }
             }
             HostMsg::TelemetryUpdate { cpu_percent, mem_used_mb, load_avg, per_core, uptime_secs } => {
                 let total_mem = self.host.as_ref().map(|h| h.total_mem_mb).unwrap_or(1).max(1);
@@ -658,6 +707,17 @@ impl PaneApp {
                                 raise_target = Some(key);
                             }
                         }
+                        for g in &self.gui_windows {
+                            if g.workspace != ws {
+                                continue;
+                            }
+                            let key = WinKey::GuiApp(g.id);
+                            let selected = self.active_window == Some(key);
+                            let label = format!("[APP] {}", truncate_label(&g.title, 18));
+                            if ui.selectable_label(selected, RichText::new(label).monospace().size(11.5)).clicked() {
+                                raise_target = Some(key);
+                            }
+                        }
                         if self.processes.open && self.processes.workspace == ws {
                             let selected = self.active_window == Some(WinKey::Processes);
                             if ui
@@ -728,8 +788,8 @@ impl PaneApp {
 
 impl eframe::App for PaneApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.poll_transport();
         let ctx = ui.ctx().clone();
+        self.poll_transport(&ctx);
         self.handle_global_shortcuts(&ctx);
 
         // Keep HUD counters (VNC savings & RTT) ticking smoothly every 250 ms even when idle.
@@ -1135,6 +1195,78 @@ impl eframe::App for PaneApp {
             if self.focused_term == Some(id) {
                 self.focused_term = self.terminals.iter().rev().find(|t| t.workspace == ws).map(|t| t.id);
                 self.active_window = self.focused_term.map(WinKey::Terminal);
+            }
+        }
+
+        // Sync per-window active state with pane-host so hidden workspaces pause
+        // XDamage capture and consume 0 KB/s.
+        for g in &mut self.gui_windows {
+            let should_be_active = g.open && g.workspace == ws;
+            if g.active_sent != should_be_active {
+                g.active_sent = should_be_active;
+                outgoing.push(ClientMsg::SetGuiWindowActive { win_id: g.id, active: should_be_active });
+            }
+        }
+
+        // 10b. Floating streamed remote GUI app windows (`[APP]`).
+        let mut closed_guis = Vec::new();
+        for idx in 0..self.gui_windows.len() {
+            if self.gui_windows[idx].workspace != ws {
+                continue;
+            }
+            let win_id = self.gui_windows[idx].id;
+            let key = WinKey::GuiApp(win_id);
+            let mut open = self.gui_windows[idx].open;
+            let is_focused = self.active_window == Some(key) && !self.launcher.open;
+            let title = format!("[APP] {}", self.gui_windows[idx].title);
+            let frame = window_frame(&ctx, is_focused).inner_margin(Margin::same(2));
+
+            let (default_pos, default_size) = if let Some(&tile) = tile_rects.get(&key) {
+                (tile.min, tile.size())
+            } else {
+                let w = f32::from(self.gui_windows[idx].width).clamp(320.0, (workspace_rect.width() - 32.0).max(320.0));
+                let h = f32::from(self.gui_windows[idx].height).clamp(240.0, (workspace_rect.height() - 48.0).max(240.0));
+                (
+                    Pos2::new(
+                        (workspace_rect.center().x - w * 0.5).max(workspace_rect.left() + 8.0),
+                        (workspace_rect.center().y - h * 0.5).max(workspace_rect.top() + 8.0),
+                    ),
+                    Vec2::new(w, h),
+                )
+            };
+
+            let win = Window::new(title)
+                .id(egui::Id::unique(("gui_app_win", win_id)))
+                .open(&mut open)
+                .frame(frame)
+                .constrain_to(workspace_rect)
+                .default_pos(default_pos)
+                .default_size(default_size)
+                .min_size(Vec2::new(220.0, 160.0));
+            let win = self.apply_tile_if_needed(win, key, &tile_rects);
+
+            let resp = win.show(&ctx, |ui| show_gui_window(ui, &mut self.gui_windows[idx], is_focused, &mut outgoing));
+            if let Some(r) = &resp {
+                self.window_layers.insert(key, r.response.layer_id);
+            }
+            if resp.as_ref().and_then(|r| r.inner).unwrap_or(false)
+                || resp.as_ref().is_some_and(|r| r.response.clicked())
+            {
+                self.active_window = Some(key);
+                self.focused_term = None;
+            }
+            self.gui_windows[idx].open = open;
+            if !open {
+                closed_guis.push(win_id);
+            }
+        }
+        for win_id in closed_guis {
+            self.gui_windows.retain(|g| g.id != win_id);
+            self.window_layers.remove(&WinKey::GuiApp(win_id));
+            self.last_applied_tile_epoch.remove(&WinKey::GuiApp(win_id));
+            outgoing.push(ClientMsg::CloseGuiWindow { win_id });
+            if self.active_window == Some(WinKey::GuiApp(win_id)) {
+                self.active_window = None;
             }
         }
 
