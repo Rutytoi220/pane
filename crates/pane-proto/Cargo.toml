@@ -4,6 +4,7 @@ description = "Shared wire protocol, binary framing and terminal state-diff engi
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]

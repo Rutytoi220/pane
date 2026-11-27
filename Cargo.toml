@@ -6,6 +6,7 @@ members = ["crates/pane-proto", "crates/pane-host", "crates/pane-client"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Rutytoi220/pane"
 rust-version = "1.85"
 
 [workspace.dependencies]

@@ -58,9 +58,12 @@ Every message on `stdin`/`stdout` uses a deterministic binary frame envelope:
 
 ## Quickstart
 
-### Build & Test
+### Clone, Build & Test
 
 ```bash
+git clone https://github.com/Rutytoi220/pane.git
+cd pane
+
 # 1. Build the static musl remote agent (embedded into the client for zero-config SSH deploy)
 rustup target add x86_64-unknown-linux-musl
 cargo build --release -p pane-host --target x86_64-unknown-linux-musl
