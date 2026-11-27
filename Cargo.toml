@@ -16,10 +16,13 @@ postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 lz4_flex = "0.14"
 thiserror = "2"
 crossbeam-channel = "0.5"
+futures-core = "0.3"
 libc = "0.2"
 portable-pty = "0.9"
+reis = "0.7"
 vt100 = "0.18"
 x11rb = { version = "0.13", default-features = false, features = ["damage", "xtest", "composite", "xfixes"] }
+zbus = { version = "6", default-features = false, features = ["default-rt", "proxy"] }
 eframe = { version = "0.37", default-features = false }
 egui = "0.37"
 clap = { version = "4.5", features = ["derive"] }

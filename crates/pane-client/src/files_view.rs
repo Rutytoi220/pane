@@ -1,7 +1,7 @@
 //! Remote File Explorer state, chunked download receiver (saving to
 //! `~/Downloads`), text-preview trigger, and egui renderer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -38,6 +38,7 @@ pub struct FileExplorer {
     pub last_error: Option<String>,
     pub active_downloads: HashMap<u64, ActiveDownload>,
     pub recent_downloads: Vec<CompletedDownload>,
+    pending_list_reqs: HashSet<u64>,
     next_req_id: u64,
 }
 
@@ -55,8 +56,13 @@ impl FileExplorer {
             last_error: None,
             active_downloads: HashMap::new(),
             recent_downloads: Vec::new(),
+            pending_list_reqs: HashSet::new(),
             next_req_id: 1,
         }
+    }
+
+    pub fn owns_req(&self, req_id: u64) -> bool {
+        self.pending_list_reqs.contains(&req_id) || self.active_downloads.contains_key(&req_id)
     }
 
     fn alloc_req_id(&mut self) -> u64 {
@@ -70,10 +76,12 @@ impl FileExplorer {
         let req_id = self.alloc_req_id();
         self.loading = true;
         self.last_error = None;
+        self.pending_list_reqs.insert(req_id);
         out.push(ClientMsg::ListDir { req_id, path });
     }
 
-    pub fn on_listing(&mut self, path: String, entries: Vec<DirEntry>) {
+    pub fn on_listing(&mut self, req_id: u64, path: String, entries: Vec<DirEntry>) {
+        self.pending_list_reqs.remove(&req_id);
         self.current_path = path.clone();
         self.path_input = path;
         self.entries = entries;
@@ -147,6 +155,7 @@ impl FileExplorer {
     pub fn on_error(&mut self, req_id: Option<u64>, message: String) {
         self.loading = false;
         if let Some(id) = req_id {
+            self.pending_list_reqs.remove(&id);
             self.active_downloads.remove(&id);
         }
         self.last_error = Some(message);

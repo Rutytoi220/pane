@@ -109,7 +109,9 @@ pub fn show_gui_window(
     let avail = ui.available_size().max(Vec2::new(160.0, 120.0));
     let (outer_rect, resp) = ui.allocate_exact_size(avail, Sense::click_and_drag());
 
-    if resp.clicked() || resp.drag_started() {
+    let pointer_pressed_inside =
+        resp.hovered() && ui.input(|i| i.pointer.any_pressed());
+    if resp.clicked() || resp.drag_started() || resp.is_pointer_button_down_on() || pointer_pressed_inside {
         clicked = true;
         win.want_focus = true;
     }
@@ -164,7 +166,8 @@ pub fn show_gui_window(
     };
 
     // Pointer move, mouse button press/release, and scroll wheel forwarding.
-    if resp.hovered() || resp.dragged() {
+    let pointer_over_canvas = resp.hovered() || resp.dragged() || resp.is_pointer_button_down_on();
+    if pointer_over_canvas {
         let hover_pos = ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
         if let Some(pos) = hover_pos {
             let (rx, ry) = map_pos(pos);
@@ -175,7 +178,9 @@ pub fn show_gui_window(
 
             ui.input(|i| {
                 for ev in &i.events {
-                    if let Event::PointerButton { pos, button, pressed, .. } = ev {
+                    if let Event::PointerButton { pos, button, pressed, .. } = ev
+                        && outer_rect.contains(*pos)
+                    {
                         let (bx, by) = map_pos(*pos);
                         let x11_btn = match button {
                             PointerButton::Primary => 1,

@@ -422,7 +422,7 @@ impl PaneApp {
                     t.exit_code = exit_code;
                 }
             }
-            HostMsg::DirListing { path, entries, .. } => self.files.on_listing(path, entries),
+            HostMsg::DirListing { req_id, path, entries } => self.files.on_listing(req_id, path, entries),
             HostMsg::FileChunk { req_id, total_size, data, eof, .. } => {
                 if let Some(notice) = self.files.on_chunk(req_id, total_size, &data, eof) {
                     self.notify(notice, theme::ACCENT_GREEN);
@@ -494,12 +494,12 @@ impl PaneApp {
                 };
             }
             HostMsg::Error { req_id, message } => {
-                if let Some(id) = req_id
-                    && let Some(v) = self.viewers.iter_mut().find(|v| v.req_id == id)
-                {
-                    v.set_error(message.clone());
-                } else {
-                    self.files.on_error(req_id, message.clone());
+                if let Some(id) = req_id {
+                    if let Some(v) = self.viewers.iter_mut().find(|v| v.req_id == id) {
+                        v.set_error(message.clone());
+                    } else if self.files.owns_req(id) {
+                        self.files.on_error(Some(id), message.clone());
+                    }
                 }
                 self.notify(message, theme::ACCENT_CORAL);
             }
@@ -1264,7 +1264,10 @@ impl eframe::App for PaneApp {
                 self.window_layers.insert(key, r.response.layer_id);
             }
             if resp.as_ref().and_then(|r| r.inner).unwrap_or(false)
-                || resp.as_ref().is_some_and(|r| r.response.clicked())
+                || resp.as_ref().is_some_and(|r| {
+                    r.response.clicked()
+                        || (r.response.contains_pointer() && ctx.input(|i| i.pointer.any_pressed()))
+                })
             {
                 self.active_window = Some(key);
                 self.focused_term = None;

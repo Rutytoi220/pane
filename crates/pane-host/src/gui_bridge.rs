@@ -30,6 +30,7 @@ use x11rb::protocol::xtest;
 use x11rb::rust_connection::RustConnection;
 
 use crate::outbox::Outbox;
+use crate::wayland_bridge::{self, EiInjector, WAYLAND_DESKTOP_WIN_ID, WaylandDesktopStream};
 
 const FALLBACK_DISPLAY: &str = ":99";
 /// Coalesced damage capture cadence (~30 FPS max per active window).
@@ -161,6 +162,8 @@ struct X11State {
     shift_keycode: Option<u8>,
     shift_held: bool,
     focused_win: Option<Window>,
+    ei: Option<EiInjector>,
+    wayland_stream: Option<WaylandDesktopStream>,
 }
 
 struct Atoms {
@@ -175,6 +178,9 @@ struct Atoms {
 
 impl Drop for X11State {
     fn drop(&mut self) {
+        if let Some(stream) = self.wayland_stream.take() {
+            stream.stop();
+        }
         if let Some(mut child) = self.xvfb.take() {
             log!("stopping Xvfb {}", self.display_name);
             let _ = child.kill();
@@ -219,7 +225,7 @@ fn bridge_loop(rx: Receiver<Cmd>, outbox: Outbox) {
                         }
                     }
                     if let Some(st) = x11.as_mut()
-                        && let Err(msg) = st.attach_root_desktop(&outbox)
+                        && let Err(msg) = st.attach_root_desktop(req_id, &outbox)
                     {
                         outbox.send(HostMsg::Error { req_id: Some(req_id), message: msg });
                     }
@@ -257,13 +263,17 @@ fn bridge_loop(rx: Receiver<Cmd>, outbox: Outbox) {
                     }
                 }
                 Ok(Cmd::SetActive { win_id, active }) => {
-                    if let Some(st) = x11.as_mut()
-                        && let Some(w) = st.windows.get_mut(&win_id)
-                    {
-                        let was_active = w.active;
-                        w.active = active;
-                        if active && !was_active {
-                            w.dirty = Some(DirtyRect { x: 0, y: 0, w: w.width, h: w.height });
+                    if let Some(st) = x11.as_mut() {
+                        if win_id == WAYLAND_DESKTOP_WIN_ID {
+                            if let Some(ws) = st.wayland_stream.as_ref() {
+                                ws.set_active(active);
+                            }
+                        } else if let Some(w) = st.windows.get_mut(&win_id) {
+                            let was_active = w.active;
+                            w.active = active;
+                            if active && !was_active {
+                                w.dirty = Some(DirtyRect { x: 0, y: 0, w: w.width, h: w.height });
+                            }
                         }
                     }
                 }
@@ -429,6 +439,18 @@ fn init_x11() -> Result<X11State, String> {
     let (keymap, shift_keycode) = build_keymap(&conn);
     let _ = conn.flush();
 
+    let ei = if xvfb.is_none() && wayland_bridge::has_wayland_session() {
+        match EiInjector::connect_kwin() {
+            Ok(inj) => Some(inj),
+            Err(e) => {
+                log!("KWin EIS not available ({e}); will use X11 XTEST");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(X11State {
         conn,
         display_name,
@@ -442,6 +464,8 @@ fn init_x11() -> Result<X11State, String> {
         shift_keycode,
         shift_held: false,
         focused_win: None,
+        ei,
+        wayland_stream: None,
     })
 }
 
@@ -512,9 +536,9 @@ fn build_keymap(conn: &RustConnection) -> (HashMap<u32, (u8, bool)>, Option<u8>)
 }
 
 impl X11State {
-    /// Attach an XDamage monitor to the active display's root window so the
-    /// entire live desktop streams into a `pane` `[APP]` window.
-    fn attach_root_desktop(&mut self, outbox: &Outbox) -> Result<(), String> {
+    /// Attach an XDamage monitor to the active display's root window (on Xorg/Xvfb)
+    /// or open a `ScreenCast` + PipeWire full-desktop stream on Wayland.
+    fn attach_root_desktop(&mut self, req_id: u64, outbox: &Outbox) -> Result<(), String> {
         let root = self.root;
         let geom = self
             .conn
@@ -525,8 +549,8 @@ impl X11State {
 
         // Probe whether the X server exposes a readable root framebuffer.
         // Rootless Xwayland (e.g. KDE Plasma Wayland / GNOME Wayland) returns
-        // BadMatch on root get_image; detect this immediately instead of
-        // opening a blank desktop window, and adopt any open X11 app windows.
+        // BadMatch on root get_image; on Wayland, stream the full compositor
+        // desktop via org.freedesktop.portal.ScreenCast + PipeWire + KWin EIS.
         let root_readable = self
             .conn
             .get_image(ImageFormat::Z_PIXMAP, root, 0, 0, 1, 1, u32::MAX)
@@ -535,15 +559,23 @@ impl X11State {
             .is_some_and(|r| r.data.len() >= 4);
         if !root_readable {
             let adopted = self.adopt_existing_windows(outbox);
+            if wayland_bridge::has_wayland_session() {
+                if let Some(old) = self.wayland_stream.take() {
+                    old.stop();
+                }
+                self.wayland_stream = Some(wayland_bridge::spawn_desktop_stream(req_id, outbox.clone()));
+                if adopted > 0 {
+                    log!("adopted {adopted} Xwayland window(s) alongside Wayland desktop stream");
+                }
+                return Ok(());
+            }
             let extra = if adopted > 0 {
                 format!(" Attached {adopted} open X11/Xwayland window(s).")
             } else {
                 String::new()
             };
             return Err(format!(
-                "Display {} is running rootless Xwayland (Wayland session), which does not expose a root desktop \
-                 framebuffer.{extra} Launch GUI apps (e.g. dolphin, kcalc, firefox, konsole --nofork) from Ctrl+Space \
-                 to stream their windows seamlessly inside pane.",
+                "Display {} does not expose a root desktop framebuffer.{extra}",
                 self.display_name
             ));
         }
@@ -682,9 +714,9 @@ impl X11State {
             return;
         }
 
-        // Only reposition negative-coordinate windows on our private Xvfb.
-        let mut x = geom.x;
-        let mut y = geom.y;
+        // Translate window origin into root-screen coordinates so reparented
+        // windows (e.g. WM frames) receive clicks at the exact desktop position.
+        let (mut x, mut y) = self.translate_to_root(win).unwrap_or((geom.x, geom.y));
         if self.xvfb.is_some() && (x < 0 || y < 0) {
             x = x.max(0);
             y = y.max(0);
@@ -729,12 +761,14 @@ impl X11State {
     }
 
     fn on_configure_notify(&mut self, win: Window, x: i16, y: i16, width: u16, height: u16, outbox: &Outbox) {
+        let translated = self.translate_to_root(win);
         let Some(tw) = self.windows.get_mut(&win) else {
             return;
         };
         if !tw.is_root {
-            tw.x = x;
-            tw.y = y;
+            let (rx, ry) = translated.unwrap_or((x, y));
+            tw.x = rx;
+            tw.y = ry;
         }
         if (tw.width, tw.height) != (width, height) && width > 0 && height > 0 {
             tw.width = width;
@@ -742,6 +776,11 @@ impl X11State {
             tw.dirty = Some(DirtyRect { x: 0, y: 0, w: width, h: height });
             outbox.send(HostMsg::GuiWindowResized { win_id: win, width, height });
         }
+    }
+
+    fn translate_to_root(&self, win: Window) -> Option<(i16, i16)> {
+        let reply = self.conn.translate_coordinates(win, self.root, 0, 0).ok()?.reply().ok()?;
+        Some((reply.dst_x, reply.dst_y))
     }
 
     fn on_window_gone(&mut self, win: Window, outbox: &Outbox) {
@@ -851,12 +890,15 @@ impl X11State {
     }
 
     fn to_root_coords(&self, win_id: Window, x: i16, y: i16) -> Option<(i16, i16)> {
+        if win_id == WAYLAND_DESKTOP_WIN_ID {
+            return Some((x.max(0), y.max(0)));
+        }
         let tw = self.windows.get(&win_id)?;
         Some((tw.x.saturating_add(x), tw.y.saturating_add(y)))
     }
 
     fn focus_window(&mut self, win_id: Window) {
-        if win_id == self.root {
+        if win_id == self.root || win_id == WAYLAND_DESKTOP_WIN_ID {
             return;
         }
         if self.focused_win != Some(win_id) {
@@ -866,10 +908,18 @@ impl X11State {
         }
     }
 
+    fn active_ei(&self) -> Option<&EiInjector> {
+        self.ei.as_ref().filter(|e| e.is_alive())
+    }
+
     fn handle_mouse_move(&mut self, win_id: Window, x: i16, y: i16) {
         let Some((rx, ry)) = self.to_root_coords(win_id, x, y) else {
             return;
         };
+        if let Some(ei) = self.active_ei() {
+            ei.mouse_move(f32::from(rx), f32::from(ry));
+            return;
+        }
         let _ = xtest::fake_input(&self.conn, xproto::MOTION_NOTIFY_EVENT, 0, 0, self.root, rx, ry, 0);
         let _ = self.conn.flush();
     }
@@ -880,6 +930,11 @@ impl X11State {
         };
         if pressed {
             self.focus_window(win_id);
+        }
+        if let Some(ei) = self.active_ei() {
+            let _ = self.conn.flush();
+            ei.mouse_button(button, pressed, f32::from(rx), f32::from(ry));
+            return;
         }
         let _ = xtest::fake_input(&self.conn, xproto::MOTION_NOTIFY_EVENT, 0, 0, self.root, rx, ry, 0);
         let ev_type = if pressed { xproto::BUTTON_PRESS_EVENT } else { xproto::BUTTON_RELEASE_EVENT };
@@ -894,6 +949,10 @@ impl X11State {
         if delta_y == 0 {
             return;
         }
+        if let Some(ei) = self.active_ei() {
+            ei.scroll(delta_y, f32::from(rx), f32::from(ry));
+            return;
+        }
         let button: u8 = if delta_y > 0 { 4 } else { 5 };
         let steps = (delta_y.unsigned_abs() / 16).clamp(1, 5);
         let _ = xtest::fake_input(&self.conn, xproto::MOTION_NOTIFY_EVENT, 0, 0, self.root, rx, ry, 0);
@@ -905,11 +964,16 @@ impl X11State {
     }
 
     fn handle_key(&mut self, win_id: Window, keysym: u32, pressed: bool) {
-        if !self.windows.contains_key(&win_id) {
+        if win_id != WAYLAND_DESKTOP_WIN_ID && !self.windows.contains_key(&win_id) {
             return;
         }
         if pressed {
             self.focus_window(win_id);
+        }
+        if let Some(ei) = self.active_ei() {
+            let _ = self.conn.flush();
+            ei.key(keysym, pressed);
+            return;
         }
         if keysym == XK_SHIFT_L || keysym == XK_SHIFT_R {
             self.shift_held = pressed;
@@ -937,6 +1001,13 @@ impl X11State {
     }
 
     fn handle_close_window(&mut self, win_id: Window, outbox: &Outbox) {
+        if win_id == WAYLAND_DESKTOP_WIN_ID {
+            if let Some(stream) = self.wayland_stream.take() {
+                stream.stop();
+            }
+            outbox.send(HostMsg::GuiWindowClosed { win_id });
+            return;
+        }
         let Some(tw) = self.windows.get(&win_id) else {
             return;
         };

@@ -23,6 +23,7 @@ mod services;
 mod sysinfo;
 mod telemetry;
 mod terminal;
+mod wayland_bridge;
 
 use std::io::{self, BufReader};
 
