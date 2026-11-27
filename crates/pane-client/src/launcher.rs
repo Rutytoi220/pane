@@ -78,10 +78,11 @@ const NATIVE_APPS: &[NativeAppItem] = &[
 ];
 
 const GUI_PRESETS: &[(&str, &str)] = &[
-    ("firefox", "Launch remote Firefox over waypipe / SSH X11"),
-    ("thunar", "Launch remote Thunar file manager over waypipe / SSH X11"),
-    ("code", "Launch remote VS Code over waypipe / SSH X11"),
-    ("gedit", "Launch remote gedit text editor over waypipe / SSH X11"),
+    ("firefox", "Launch remote Firefox"),
+    ("dolphin", "Launch remote KDE Dolphin file manager"),
+    ("kcalc", "Launch remote KCalc calculator"),
+    ("konsole --nofork", "Launch remote KDE Konsole terminal"),
+    ("thunar", "Launch remote Thunar file manager"),
 ];
 
 pub struct AppLauncher {

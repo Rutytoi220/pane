@@ -24,7 +24,7 @@ use x11rb::protocol::composite;
 use x11rb::protocol::damage;
 use x11rb::protocol::xproto::{
     self, Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent, ConfigureWindowAux,
-    ConnectionExt as XprotoExt, EventMask, ImageFormat, InputFocus, StackMode, Window,
+    ConnectionExt as XprotoExt, EventMask, ImageFormat, InputFocus, MapState, StackMode, Window,
 };
 use x11rb::protocol::xtest;
 use x11rb::rust_connection::RustConnection;
@@ -168,6 +168,9 @@ struct Atoms {
     utf8_string: Atom,
     wm_protocols: Atom,
     wm_delete_window: Atom,
+    net_client_list: Atom,
+    net_wm_state: Atom,
+    net_wm_state_skip_taskbar: Atom,
 }
 
 impl Drop for X11State {
@@ -418,6 +421,9 @@ fn init_x11() -> Result<X11State, String> {
         utf8_string: intern(b"UTF8_STRING"),
         wm_protocols: intern(b"WM_PROTOCOLS"),
         wm_delete_window: intern(b"WM_DELETE_WINDOW"),
+        net_client_list: intern(b"_NET_CLIENT_LIST"),
+        net_wm_state: intern(b"_NET_WM_STATE"),
+        net_wm_state_skip_taskbar: intern(b"_NET_WM_STATE_SKIP_TASKBAR"),
     };
 
     let (keymap, shift_keycode) = build_keymap(&conn);
@@ -447,15 +453,26 @@ fn spawn_gui_command(command: &str, display_name: &str, xauthority: Option<&Path
     log!("launching GUI app on {display_name}: {trimmed}");
     let mut cmd = Command::new("sh");
     cmd.args(["-c", trimmed])
+        .env_remove("WAYLAND_DISPLAY")
         .env("DISPLAY", display_name)
         .env("XDG_SESSION_TYPE", "x11")
         .env("GDK_BACKEND", "x11")
         .env("QT_QPA_PLATFORM", "xcb")
+        .env("MOZ_ENABLE_WAYLAND", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if let Some(xa) = xauthority {
         cmd.env("XAUTHORITY", xa);
+    }
+    let uid = unsafe { libc::geteuid() };
+    let runtime_dir = format!("/run/user/{uid}");
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() && Path::new(&runtime_dir).is_dir() {
+        cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
+    }
+    let dbus_sock = format!("{runtime_dir}/bus");
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() && Path::new(&dbus_sock).exists() {
+        cmd.env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={dbus_sock}"));
     }
     cmd.spawn().map_err(|e| format!("failed to launch `{trimmed}`: {e}"))?;
     Ok(())
@@ -505,6 +522,32 @@ impl X11State {
             .ok()
             .and_then(|c| c.reply().ok())
             .ok_or_else(|| format!("failed to query root geometry on {}", self.display_name))?;
+
+        // Probe whether the X server exposes a readable root framebuffer.
+        // Rootless Xwayland (e.g. KDE Plasma Wayland / GNOME Wayland) returns
+        // BadMatch on root get_image; detect this immediately instead of
+        // opening a blank desktop window, and adopt any open X11 app windows.
+        let root_readable = self
+            .conn
+            .get_image(ImageFormat::Z_PIXMAP, root, 0, 0, 1, 1, u32::MAX)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|r| r.data.len() >= 4);
+        if !root_readable {
+            let adopted = self.adopt_existing_windows(outbox);
+            let extra = if adopted > 0 {
+                format!(" Attached {adopted} open X11/Xwayland window(s).")
+            } else {
+                String::new()
+            };
+            return Err(format!(
+                "Display {} is running rootless Xwayland (Wayland session), which does not expose a root desktop \
+                 framebuffer.{extra} Launch GUI apps (e.g. dolphin, kcalc, firefox, konsole --nofork) from Ctrl+Space \
+                 to stream their windows seamlessly inside pane.",
+                self.display_name
+            ));
+        }
+
         let title = format!("Live Desktop ({})", self.display_name);
 
         if let Some(tw) = self.windows.get_mut(&root) {
@@ -552,6 +595,52 @@ impl X11State {
         Ok(())
     }
 
+    /// Adopt already-mapped viewable top-level X11/Xwayland client windows.
+    fn adopt_existing_windows(&mut self, outbox: &Outbox) -> usize {
+        let mut candidates: Vec<Window> = Vec::new();
+        if self.atoms.net_client_list != 0
+            && let Ok(c) = self.conn.get_property(false, self.root, self.atoms.net_client_list, AtomEnum::WINDOW, 0, 256)
+            && let Ok(r) = c.reply()
+            && let Some(iter) = r.value32()
+        {
+            candidates.extend(iter);
+        }
+        if candidates.is_empty()
+            && let Ok(c) = self.conn.query_tree(self.root)
+            && let Ok(r) = c.reply()
+        {
+            candidates.extend(r.children);
+        }
+
+        let before = self.windows.len();
+        for win in candidates {
+            if self.windows.contains_key(&win) || win == self.root {
+                continue;
+            }
+            let Ok(attrs) = self.conn.get_window_attributes(win).and_then(|c| Ok(c.reply())) else {
+                continue;
+            };
+            let Ok(attrs) = attrs else { continue };
+            if attrs.map_state != MapState::VIEWABLE || attrs.override_redirect {
+                continue;
+            }
+            self.on_map_notify(win, false, outbox);
+        }
+        self.windows.len().saturating_sub(before)
+    }
+
+    fn is_skip_taskbar(&self, win: Window) -> bool {
+        if self.atoms.net_wm_state == 0 || self.atoms.net_wm_state_skip_taskbar == 0 {
+            return false;
+        }
+        self.conn
+            .get_property(false, win, self.atoms.net_wm_state, AtomEnum::ATOM, 0, 32)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(|mut it| it.any(|a| a == self.atoms.net_wm_state_skip_taskbar)))
+            .unwrap_or(false)
+    }
+
     fn poll_events(&mut self, outbox: &Outbox) {
         while let Ok(Some(ev)) = self.conn.poll_for_event() {
             match ev {
@@ -587,6 +676,9 @@ impl X11State {
             return;
         };
         if geom.width < 16 || geom.height < 16 {
+            return;
+        }
+        if !override_redirect && self.is_skip_taskbar(win) {
             return;
         }
 
