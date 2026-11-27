@@ -17,7 +17,9 @@ pub enum LauncherAction {
     ToggleMonitor,
     OpenServices,
     TileWindows,
-    /// Launch a remote X11 GUI app seamlessly inside `pane` via Xvfb + XDamage.
+    /// Attach to the remote host's live X11/Xwayland desktop (`:0` / `:1`).
+    AttachLiveDesktop,
+    /// Launch a remote X11 GUI app seamlessly inside `pane` via live X11 or Xvfb.
     LaunchEmbeddedGui(String),
     /// Launch a remote GUI app externally via `waypipe ssh` / `ssh -Y`.
     RunExternalGui(String),
@@ -60,6 +62,12 @@ const NATIVE_APPS: &[NativeAppItem] = &[
         tag: "[MON]",
         desc: "Toggle the live CPU, RAM, and VNC bandwidth-savings monitor",
         action: LauncherAction::ToggleMonitor,
+    },
+    NativeAppItem {
+        name: "Stream Live Desktop (:0)",
+        tag: "[DESK]",
+        desc: "Attach to the remote host's live X11/Xwayland desktop (:0/:1) inside pane",
+        action: LauncherAction::AttachLiveDesktop,
     },
     NativeAppItem {
         name: "Tile Windows",

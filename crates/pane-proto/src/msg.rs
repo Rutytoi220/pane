@@ -65,6 +65,10 @@ pub enum ClientMsg {
     CloseGuiWindow { win_id: u32 },
     /// Pause or resume XDamage capture (e.g. when switching virtual workspaces).
     SetGuiWindowActive { win_id: u32, active: bool },
+    /// Attach to the host's live X11/Xwayland root display (`:0`/`:1`, or fallback `Xvfb :99`).
+    AttachDesktop { req_id: u64 },
+    /// Notify the host of the client's desktop viewport size hint.
+    ResizeDesktopView { win_id: u32, width: u16, height: u16 },
 }
 
 /// Messages sent from the remote headless host to the local GPU client.

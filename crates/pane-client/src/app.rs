@@ -300,6 +300,11 @@ impl PaneApp {
             }
             LauncherAction::OpenServices => self.open_services(ctx, out),
             LauncherAction::TileWindows => self.trigger_tile(),
+            LauncherAction::AttachLiveDesktop => {
+                let req_id = self.alloc_aux_req_id();
+                self.notify("Attaching to remote Live Desktop (:0/:1)...".into(), theme::ACCENT_CYAN);
+                out.push(ClientMsg::AttachDesktop { req_id });
+            }
             LauncherAction::LaunchEmbeddedGui(cmd) => {
                 let req_id = self.alloc_aux_req_id();
                 self.notify(format!("Launching `{cmd}` inside pane (Xvfb)..."), theme::ACCENT_CYAN);
@@ -660,6 +665,15 @@ impl PaneApp {
                     } else {
                         self.open_services(ctx, out);
                     }
+                }
+                if ui
+                    .button(RichText::new("Live Desktop").color(theme::ACCENT_VIOLET).strong())
+                    .on_hover_text("Stream remote host's live X11/Xwayland desktop (:0/:1) inside pane")
+                    .clicked()
+                {
+                    let req_id = self.alloc_aux_req_id();
+                    self.notify("Attaching to remote Live Desktop (:0/:1)...".into(), theme::ACCENT_CYAN);
+                    out.push(ClientMsg::AttachDesktop { req_id });
                 }
                 if ui.selectable_label(self.monitor.open, "Monitor").clicked() {
                     self.monitor.open = !self.monitor.open;
