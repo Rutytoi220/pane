@@ -264,7 +264,18 @@ fn build_command(mode: &LaunchMode, deployed_remote_bin: Option<&str>) -> Comman
     match mode {
         LaunchMode::Ssh { target, host_bin, ssh_opts } => {
             let mut cmd = ssh_base_command(target, ssh_opts);
-            cmd.arg(deployed_remote_bin.unwrap_or(host_bin.as_str()));
+            // Inject session-env for ScreenCast compatibility (Desktop Portal needs
+            // XDG_SESSION_TYPE=wayland/x11 rather than tty which blocks granting).
+            // $DBUS_SESSION_BUS_ADDRESS and other creds are inherited from the SSH
+            // PAM session; we force WAYLAND_DISPLAY to ensure portal matches the user
+            // desktop where the consent dialog is shown.
+            let remote_bin = deployed_remote_bin.unwrap_or(host_bin.as_str());
+            cmd.args([
+                "env",
+                "XDG_SESSION_TYPE=wayland",
+                "WAYLAND_DISPLAY=wayland-1",
+                &remote_bin,
+            ]);
             cmd
         }
         LaunchMode::Demo { host_bin_override } => {
