@@ -48,6 +48,10 @@ struct Args {
     /// Stay attached to the launching terminal and stream logs to stderr.
     #[arg(long, short = 'f')]
     foreground: bool,
+
+    /// Terminal-only mode (no live desktop stream).
+    #[arg(long)]
+    shell: bool,
 }
 
 fn main() -> Result<()> {
@@ -78,7 +82,7 @@ fn main() -> Result<()> {
         native_options,
         Box::new(move |cc| {
             theme::install(&cc.egui_ctx);
-            Ok(Box::new(app::PaneApp::new(cc.egui_ctx.clone(), mode)))
+            Ok(Box::new(app::PaneApp::new(cc.egui_ctx.clone(), mode, !args.shell)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))

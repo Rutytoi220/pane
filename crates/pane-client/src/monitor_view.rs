@@ -33,7 +33,7 @@ pub struct SystemMonitor {
 
 impl SystemMonitor {
     pub fn new() -> Self {
-        Self { open: true, docked: true }
+        Self { open: false, docked: true }
     }
 
     pub fn show(

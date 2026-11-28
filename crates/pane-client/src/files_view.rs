@@ -45,7 +45,7 @@ pub struct FileExplorer {
 impl FileExplorer {
     pub fn new() -> Self {
         Self {
-            open: true,
+            open: false,
             docked: true,
             current_path: "~".into(),
             path_input: "~".into(),

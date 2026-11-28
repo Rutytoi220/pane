@@ -1,6 +1,6 @@
 //! Root egui desktop environment:
-//! - Top HUD bar: brand, virtual workspaces (`1`, `2`, `3`), host info, live
-//!   RTT ping, compressed KB/s rate, total bytes, and VNC bandwidth savings.
+//! - Top HUD bar: brand, virtual workspaces (`1 | 2 | 3`), host info (connected dot + hostname), live
+//!   RTT ping, compressed KB/s rate.
 //! - Docked/floating File Explorer (left) & System Monitor (right), clamped to
 //!   <= 32% viewport width each.
 //! - Constrained `CentralPanel` workspace for `[TERM]`, `[VIEW]`, `[PROC]`, and
@@ -9,17 +9,18 @@
 //!   -> `ssh -Y` fallback).
 //! - Bottom Desktop Dock / Taskbar with quick-launchers, `Tile Windows`, and
 //!   one-click window switcher tabs for the active workspace.
+//! - Monitor picker overlay (displayed when multiple monitors found in live-streaming mode).
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use egui::{CentralPanel, Color32, Frame, Key, LayerId, Margin, Panel, Pos2, Rect, RichText, Sense, Stroke, Vec2, Window};
+use egui::{ CentralPanel, Color32, Frame, Key, LayerId, Margin, Panel, Pos2, Rect, RichText, Sense, Stroke, Vec2, Window };
 use pane_proto::{ClientMsg, HostMsg, MonitorInfo, PROTOCOL_VERSION};
 
 use crate::files_view::FileExplorer;
 use crate::gui_window_view::{GuiWindowPane, show_gui_window};
 use crate::launcher::{AppLauncher, LauncherAction, spawn_remote_gui_app};
-use crate::metrics::{SessionMetrics, fmt_bytes};
+use crate::metrics::SessionMetrics;
 use crate::monitor_view::{HostInfo, SystemMonitor, TelemetryState};
 use crate::processes_view::ProcessManager;
 use crate::services_view::ServiceManager;
@@ -43,6 +44,7 @@ enum WinKey {
 
 pub struct PaneApp {
     mode: LaunchMode,
+    live_streaming: bool,
     transport: Option<Transport>,
     host: Option<HostInfo>,
     telemetry: TelemetryState,
@@ -72,8 +74,8 @@ pub struct PaneApp {
     services: ServiceManager,
     launcher: AppLauncher,
     monitors: Vec<MonitorInfo>,
-
-    /// Workspace rect captured from `CentralPanel` each frame.
+    monitor_attached: bool,
+    monitor_picker_pending: usize,
     workspace_rect: Rect,
     /// True once the first `CentralPanel` pass has measured the real workspace rect.
     layout_ready: bool,
@@ -82,15 +84,28 @@ pub struct PaneApp {
     /// Last rendered `LayerId` per floating window so taskbar clicks can raise it.
     window_layers: HashMap<WinKey, LayerId>,
 
+    // ── Global shortcut pending flags │ handled after handle_global_shortcuts ──
+    pending_new_terminal: bool,
+    pending_live_desktop: bool,
+    fullscreen_mode: bool,
+    pending_fullscreen: bool,
+
+    /// Pending attachment to monitor at this index (set by picker).
+    pending_monitor_index: usize,
+
+    /// Index into `self.monitors` of the currently highlighted item in the picker overlay.
+    pending_monitor_selection: Option<u32>,
+
     status_banner: Option<(String, Color32, Instant)>,
     disconnect_reason: Option<String>,
     stderr_tail: VecDeque<String>,
 }
 
 impl PaneApp {
-    pub fn new(ctx: egui::Context, mode: LaunchMode) -> Self {
+    pub fn new(ctx: egui::Context, mode: LaunchMode, live_streaming: bool) -> Self {
         let mut app = Self {
             mode: mode.clone(),
+            live_streaming,
             transport: None,
             host: None,
             telemetry: TelemetryState::default(),
@@ -113,6 +128,14 @@ impl PaneApp {
             services: ServiceManager::new(),
             launcher: AppLauncher::new(),
             monitors: Vec::new(),
+            monitor_attached: false,
+            monitor_picker_pending: 0,
+            pending_new_terminal: false,
+            pending_live_desktop: false,
+            fullscreen_mode: false,
+            pending_fullscreen: false,
+            pending_monitor_index: usize::MAX,
+            pending_monitor_selection: None,
             workspace_rect: Rect::from_min_size(Pos2::new(270.0, 36.0), Vec2::new(880.0, 780.0)),
             layout_ready: false,
             active_window: None,
@@ -379,6 +402,13 @@ impl PaneApp {
             HostMsg::Welcome { hostname, os_info, cpu_cores, total_mem_mb, home_dir, .. } => {
                 self.host = Some(HostInfo { hostname, os_info, cpu_cores, total_mem_mb });
                 self.files.request_dir(home_dir, out);
+
+                // Auto-trigger monitor discovery in live-desktop mode.
+                if self.live_streaming {
+                    let req_id = self.alloc_aux_req_id();
+                    out.push(ClientMsg::ListMonitors { req_id });
+                }
+
                 if self.terminals.is_empty() {
                     let id = self.next_term_id;
                     self.next_term_id += 1;
@@ -392,6 +422,17 @@ impl PaneApp {
             }
             HostMsg::MonitorList { req_id: _, monitors } => {
                 self.monitors = monitors;
+                // In live-streaming mode: auto-attach if <=1 monitor, else trigger picker.
+                if self.live_streaming && !self.monitor_attached {
+                    if self.monitors.len() <= 1 {
+                        let attach_req_id = self.alloc_aux_req_id();
+                        out.push(ClientMsg::AttachDesktop { req_id: attach_req_id, monitor_index: Some(0) });
+                        self.monitor_attached = true;
+                    } else {
+                        // Will be handled by monitor picker overlay below (set state to show picker)
+                        self.monitor_picker_pending = self.monitors.len();
+                    }
+                }
             }
             HostMsg::Pong { timestamp_micros } => self.metrics.record_pong(timestamp_micros),
             HostMsg::TermDiff {
@@ -527,6 +568,18 @@ impl PaneApp {
                 } else if i.consume_key(egui::Modifiers::ALT, Key::Num3) {
                     target_ws = Some(3);
                 }
+                // Alt+N: new terminal
+                if i.consume_key(egui::Modifiers::ALT, Key::N) {
+                    self.pending_new_terminal = true;
+                }
+                // Alt+D: live desktop attach (no specific monitor → auto-select)
+                if i.consume_key(egui::Modifiers::ALT, Key::D) {
+                    self.pending_live_desktop = true;
+                }
+                // Alt+F: toggle fullscreen mode
+                if i.consume_key(egui::Modifiers::ALT, Key::F) {
+                    self.pending_fullscreen = true;
+                }
             }
         });
 
@@ -613,17 +666,6 @@ impl PaneApp {
 
                 // Real-time compressed bandwidth rate.
                 hud_pill(ui, "RATE", &format!("{:.1} KB/s", self.metrics.bandwidth_kb_per_sec()), theme::ACCENT_CYAN);
-
-                // Total bytes transferred.
-                hud_pill(ui, "TOTAL", &fmt_bytes(self.metrics.total_bytes() as f64), theme::TEXT_PRIMARY);
-
-                // Live Bandwidth Saved vs. 1080p60 VNC (12 MB/s baseline).
-                let saved = format!(
-                    "{} ({:.2}%)",
-                    fmt_bytes(self.metrics.bytes_saved_vs_vnc()),
-                    self.metrics.saved_percent_vs_vnc()
-                );
-                hud_pill(ui, "SAVED vs 1080p60 VNC", &saved, theme::ACCENT_GREEN);
             });
         });
     }
@@ -803,6 +845,114 @@ impl PaneApp {
             win.resizable(true)
         }
     }
+
+    /// Render the monitor picker overlay (keyboard-navigable list).
+    fn show_monitor_picker(&mut self, ui: &mut egui::Ui) {
+        let n = self.monitors.len();
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Choose a monitor to attach:").strong().size(12.5).color(theme::TEXT_PRIMARY));
+        });
+        ui.add_space(4.0);
+
+        // Keyboard selection highlight tracking
+        if self.pending_monitor_selection.is_none() && n > 0 {
+            self.pending_monitor_selection =
+                self.monitors.iter().position(|m| m.is_primary).map(|i| i as u32).or(Some(0));
+        }
+
+        let mut selected_monitor: Option<u32> = None;
+
+        for (i, monitor) in self.monitors.iter().enumerate() {
+            let is_selected = self.pending_monitor_selection == Some(monitor.index);
+            let primary_hint = if monitor.is_primary { " ★" } else { "" };
+            let label = format!("[{}] {} {}x{}{}", monitor.index, monitor.name, monitor.width as u32, monitor.height, primary_hint);
+            
+            let resp = ui.selectable_label(is_selected, RichText::new(&label).monospace().size(11.0))
+                .on_hover_text(if is_selected { "Enter to confirm" } else { "Click or Arrow keys to select" });
+
+            if resp.clicked() {
+                self.pending_monitor_selection = Some(monitor.index);
+                selected_monitor = Some(monitor.index);
+            }
+            if resp.has_focus() || (is_selected && n > 0 && ui.ctx().input(|i| i.events.iter().any(|ev| matches!(ev, egui::Event::Key { key: Key::Enter, pressed: true, repeat: false, .. })))) {
+                selected_monitor = self.monitors.get(i).map(|m| m.index);
+            }
+        }
+
+        // Arrow key navigation (index-based for safety)
+        ui.input(|i| {
+            if let Some(sel) = self.pending_monitor_selection {
+                let delta = if i.key_pressed(Key::ArrowUp) {
+                    -1
+                } else if i.key_pressed(Key::ArrowDown) {
+                    1
+                } else {
+                    return;
+                };
+                let new_sel = ((sel as isize + delta).max(0) as u32).min(n.saturating_sub(1) as u32);
+                self.pending_monitor_selection = Some(new_sel);
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(RichText::new("Confirm").color(theme::ACCENT_GREEN)).clicked() {
+                selected_monitor = self.pending_monitor_selection;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align:: BOTTOM), |ui| {
+                ui.add_space(32.0);
+                if ui.button(RichText::new("Cancel").color(theme::ACCENT_CORAL)).clicked()
+                    || ui.ctx().input(|i| i.events.iter().any(|ev| matches!(ev, egui::Event::Key { key: Key::Escape, pressed: true, repeat: false, .. }))) {
+                    self.pending_monitor_selection = None;
+                }
+            });
+        });
+
+        // Confirm selection and send AttachDesktop, then dismiss picker
+        if let Some(monitor_index) = selected_monitor {
+            self.send_attach_confirm(monitor_index);
+            self.monitor_picker_pending = 0;
+            self.pending_monitor_selection = None;
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Send the attach request to the host and transition to "pending_attached" state. 
+    fn pending_attach_confirmed(&mut self, monitor_idx: usize) {
+        let req_id = self.alloc_aux_req_id();
+        self.pending_monitor_index = monitor_idx;
+        self.send(ClientMsg::AttachDesktop { req_id, monitor_index: Some(monitor_idx as u32) });
+        self.monitor_attached = false; 
+    }
+
+    /// Handle AttachDesktop error response and clean up picker state.
+    fn handle_attach_error(&mut self, req_id: Option<u64>) {
+        let pending_range = 100_000..self.next_aux_req_id;
+        if let Some(id) = req_id {
+            if pending_range.contains(&id) || self.monitor_picker_pending > 0 || self.pending_monitor_index != usize::MAX { 
+                self.notify("AttachDesktop failed. Falling back.".into(), theme::ACCENT_YELLOW);
+                self.monitor_picker_pending = 0;
+                self.pending_monitor_selection = None;
+                self.pending_monitor_index = usize::MAX;
+            }
+        }
+    }
+
+    /// Handle AttachDesktop confirm/ack flow - transitions from picker active to pending_attach. 
+    fn send_attach_confirm(&mut self, monitor_index: u32) {
+        let req_id = self.alloc_aux_req_id();
+        self.pending_monitor_index = monitor_index as usize;
+        self.send(ClientMsg::AttachDesktop { req_id, monitor_index: Some(monitor_index) });
+        self.monitor_attached = false;
+    }
+
+    /// Handle AttachDesktop cancel - dismiss picker without attaching.
+    fn send_attach_cancel(&mut self) { 
+        self.monitor_picker_pending = 0;
+        self.pending_monitor_selection = None;
+        self.pending_monitor_index = usize::MAX;
+    }
 }
 
 impl eframe::App for PaneApp {
@@ -810,6 +960,24 @@ impl eframe::App for PaneApp {
         let ctx = ui.ctx().clone();
         self.poll_transport(&ctx);
         self.handle_global_shortcuts(&ctx);
+
+        // Process global shortcut pending flags (avoids egui input borrow conflicts).
+        if self.pending_new_terminal {
+            self.spawn_terminal();
+            self.pending_new_terminal = false;
+        }
+        if self.pending_live_desktop {
+            let req_id = self.alloc_aux_req_id();
+            self.notify("Attaching to remote Live Desktop (:0/:1)...".into(), theme::ACCENT_CYAN);
+            self.send(ClientMsg::AttachDesktop { req_id, monitor_index: None });
+            self.pending_live_desktop = false;
+        }
+        if self.pending_fullscreen {
+            self.fullscreen_mode = !self.fullscreen_mode;
+            // egui 0.37: `Context::viewport_mut()` removed; fullscreen must be set via frame window options or platform API.
+            ctx.request_repaint();
+            self.pending_fullscreen = false;
+        }
 
         // Keep HUD counters (VNC savings & RTT) ticking smoothly every 250 ms even when idle.
         ctx.request_repaint_after(Duration::from_millis(250));
@@ -931,6 +1099,23 @@ impl eframe::App for PaneApp {
                 }
             });
         self.workspace_rect = workspace_rect;
+
+        // Monitor picker id (IdSalt::new avoids deprecated Id::new in egui 0.37)
+        let monitor_picker_id = egui::Id::unique("monitor_picker");
+
+        // ── Monitor picker overlay (shown when multiple monitors detected in live-streaming mode) ──
+        if self.monitor_picker_pending > 0 {
+            let center = workspace_rect.center();
+
+            let area_pos = Pos2::new(center.x - 190.0, center.y - 70.0);
+
+            egui::Area::new(monitor_picker_id)
+                .default_pos(area_pos)
+                .sense(Sense::click())
+                .show(&ctx, |ui| {
+                    self.show_monitor_picker(ui);
+                });
+        }
 
         if !self.layout_ready {
             self.layout_ready = true;
