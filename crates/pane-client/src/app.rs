@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use egui::{CentralPanel, Color32, Frame, Key, LayerId, Margin, Panel, Pos2, Rect, RichText, Sense, Stroke, Vec2, Window};
-use pane_proto::{ClientMsg, HostMsg, PROTOCOL_VERSION};
+use pane_proto::{ClientMsg, HostMsg, MonitorInfo, PROTOCOL_VERSION};
 
 use crate::files_view::FileExplorer;
 use crate::gui_window_view::{GuiWindowPane, show_gui_window};
@@ -71,6 +71,7 @@ pub struct PaneApp {
     processes: ProcessManager,
     services: ServiceManager,
     launcher: AppLauncher,
+    monitors: Vec<MonitorInfo>,
 
     /// Workspace rect captured from `CentralPanel` each frame.
     workspace_rect: Rect,
@@ -111,6 +112,7 @@ impl PaneApp {
             processes: ProcessManager::new(),
             services: ServiceManager::new(),
             launcher: AppLauncher::new(),
+            monitors: Vec::new(),
             workspace_rect: Rect::from_min_size(Pos2::new(270.0, 36.0), Vec2::new(880.0, 780.0)),
             layout_ready: false,
             active_window: None,
@@ -303,7 +305,7 @@ impl PaneApp {
             LauncherAction::AttachLiveDesktop => {
                 let req_id = self.alloc_aux_req_id();
                 self.notify("Attaching to remote Live Desktop (:0/:1)...".into(), theme::ACCENT_CYAN);
-                out.push(ClientMsg::AttachDesktop { req_id });
+                out.push(ClientMsg::AttachDesktop { req_id, monitor_index: None });
             }
             LauncherAction::LaunchEmbeddedGui(cmd) => {
                 let req_id = self.alloc_aux_req_id();
@@ -387,6 +389,9 @@ impl PaneApp {
                     self.trigger_tile();
                     out.push(ClientMsg::OpenTerminal { term_id: id, cols: 96, rows: 28 });
                 }
+            }
+            HostMsg::MonitorList { req_id: _, monitors } => {
+                self.monitors = monitors;
             }
             HostMsg::Pong { timestamp_micros } => self.metrics.record_pong(timestamp_micros),
             HostMsg::TermDiff {
@@ -673,7 +678,7 @@ impl PaneApp {
                 {
                     let req_id = self.alloc_aux_req_id();
                     self.notify("Attaching to remote Live Desktop (:0/:1)...".into(), theme::ACCENT_CYAN);
-                    out.push(ClientMsg::AttachDesktop { req_id });
+                    out.push(ClientMsg::AttachDesktop { req_id, monitor_index: None });
                 }
                 if ui.selectable_label(self.monitor.open, "Monitor").clicked() {
                     self.monitor.open = !self.monitor.open;

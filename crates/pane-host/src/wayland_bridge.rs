@@ -1,6 +1,14 @@
-//! Wayland input emulation (via `reis` / `libei` over `org.kde.KWin.EIS.RemoteDesktop`
-//! or `org.freedesktop.portal.RemoteDesktop`) and full-desktop screen streaming
-//! (via `org.freedesktop.portal.ScreenCast` + PipeWire `gst-launch-1.0`).
+//! Wayland input emulation (via `reis` / `libei`) and full-desktop screen
+//! streaming (via `org.freedesktop.portal.ScreenCast` + PipeWire `gst-launch-1.0`).
+//!
+//! Input injection priority:
+//! 1. KWin direct EIS (`org.kde.KWin.EIS.RemoteDesktop`) on KDE Plasma — no dialogs.
+//! 2. A single combined `org.freedesktop.portal.RemoteDesktop` + `ScreenCast`
+//!    session on GNOME / generic Wayland (`CreateSession` -> `SelectDevices` ->
+//!    `SelectSources` -> `Start` -> `ConnectToEIS` + `OpenPipeWireRemote`), which
+//!    shows exactly ONE consent dialog and yields both an EIS fd (input) and an
+//!    authorized PipeWire fd (capture) from the same session handle.
+//! 3. X11 XTEST (real Xorg / Xvfb sessions) — handled by `gui_bridge`.
 //!
 //! 100% pure-Rust D-Bus (`zbus`) + `libei` (`reis`) with zero C library linkage,
 //! preserving static `x86_64-unknown-linux-musl` builds.
@@ -27,6 +35,20 @@ use zbus::names::InterfaceName;
 use zbus::{Connection, OwnedObjectPath, OwnedVariant, Proxy, Variant};
 
 use crate::outbox::Outbox;
+
+/// Input injector shared between the gui-bridge thread (event handling) and the
+/// screencast thread (which establishes the portal session that provides it).
+pub type SharedEi = Arc<Mutex<Option<EiInjector>>>;
+
+/// Fresh empty [`SharedEi`] slot.
+pub fn new_shared_ei() -> SharedEi {
+    Arc::new(Mutex::new(None))
+}
+
+/// Lock the shared injector slot without poisoning on panics in other threads.
+pub fn lock_ei(ei: &SharedEi) -> std::sync::MutexGuard<'_, Option<EiInjector>> {
+    ei.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 /// Reserved window ID for the full Wayland desktop stream.
 pub const WAYLAND_DESKTOP_WIN_ID: u32 = 0xffff_fffe;
@@ -73,6 +95,10 @@ pub fn has_wayland_session() -> bool {
 struct EiDeviceSet {
     abs_dev: Option<Device>,
     abs_iface: Option<ei::PointerAbsolute>,
+    /// Absolute device region `(x, y, width, height)` in compositor logical
+    /// coordinates (from `ei_device.region`), used to map ScreenCast stream
+    /// frame coordinates onto the injected pointer's coordinate space.
+    abs_region: Option<(f32, f32, f32, f32)>,
     btn_iface: Option<ei::Button>,
     scroll_iface: Option<ei::Scroll>,
     kbd_dev: Option<Device>,
@@ -86,6 +112,10 @@ pub struct EiInjector {
     devices: Arc<Mutex<EiDeviceSet>>,
     seq: AtomicU32,
     alive: Arc<AtomicBool>,
+    /// ScreenCast stream frame size in compositor coordinates (0 = unknown ->
+    /// frame coordinates are injected verbatim).
+    stream_w: AtomicU32,
+    stream_h: AtomicU32,
 }
 
 impl EiInjector {
@@ -113,17 +143,45 @@ impl EiInjector {
     }
 
     pub fn from_fd(fd: std::os::fd::OwnedFd) -> Result<Self, String> {
-        let stream = UnixStream::from(fd);
+        Self::from_fd_inner(fd, None, None)
+    }
+
+    /// Attach an EIS sender connection obtained from a combined
+    /// `RemoteDesktop` + `ScreenCast` portal session. `stream` is the ScreenCast
+    /// stream frame size `(width, height)`; `map_id` is the stream's
+    /// `mapping_id` used to pair the stream with an `ei_region`.
+    pub fn from_fd_with_stream(
+        fd: std::os::fd::OwnedFd,
+        stream: Option<(u32, u32)>,
+        map_id: Option<String>,
+    ) -> Result<Self, String> {
+        Self::from_fd_inner(fd, stream, map_id)
+    }
+
+    /// Update the ScreenCast stream frame size once a capture stream is open
+    /// (e.g. KWin EIS was connected before the desktop stream attached).
+    pub fn set_stream_size(&self, width: u32, height: u32) {
+        self.stream_w.store(width, Ordering::Relaxed);
+        self.stream_h.store(height, Ordering::Relaxed);
+    }
+
+    fn from_fd_inner(
+        fd: std::os::fd::OwnedFd,
+        stream_size: Option<(u32, u32)>,
+        map_id: Option<String>,
+    ) -> Result<Self, String> {
+        let sock = UnixStream::from(fd);
         let devices = Arc::new(Mutex::new(EiDeviceSet::default()));
         let alive = Arc::new(AtomicBool::new(true));
         let devices_bg = Arc::clone(&devices);
         let alive_bg = Arc::clone(&alive);
+        let map_id_bg = map_id.clone();
         let (init_tx, init_rx) = crossbeam_channel::bounded::<Result<reis::event::Connection, String>>(1);
 
         thread::Builder::new()
             .name("ei-events".into())
             .spawn(move || {
-                let ctx = match ei::Context::new(stream) {
+                let ctx = match ei::Context::new(sock) {
                     Ok(c) => c,
                     Err(e) => {
                         let _ = init_tx.send(Err(format!("ei context: {e}")));
@@ -151,8 +209,12 @@ impl EiInjector {
                             );
                             let _ = ctx.flush();
                         }
-                        Ok(EiEvent::DeviceAdded(d)) => register_device(&devices_bg, &d.device),
-                        Ok(EiEvent::DeviceResumed(d)) => register_device(&devices_bg, &d.device),
+                        Ok(EiEvent::DeviceAdded(d)) => {
+                            register_device(&devices_bg, &d.device, map_id_bg.as_deref())
+                        }
+                        Ok(EiEvent::DeviceResumed(d)) => {
+                            register_device(&devices_bg, &d.device, map_id_bg.as_deref())
+                        }
                         Ok(EiEvent::DeviceRemoved(d)) => unregister_device(&devices_bg, &d.device),
                         Ok(EiEvent::Disconnected(_)) | Err(_) => break,
                         _ => {}
@@ -167,11 +229,31 @@ impl EiInjector {
             .map_err(|_| "ei event thread exited before handshake".to_owned())??;
 
         log!("connected Wayland EIS input injector");
-        Ok(Self { conn, devices, seq: AtomicU32::new(1), alive })
+        let (stream_w, stream_h) = stream_size.unwrap_or((0, 0));
+        Ok(Self {
+            conn,
+            devices,
+            seq: AtomicU32::new(1),
+            alive,
+            stream_w: AtomicU32::new(stream_w),
+            stream_h: AtomicU32::new(stream_h),
+        })
     }
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Map a ScreenCast stream frame point into the absolute device region's
+    /// coordinate space (identity when stream size or region is unknown).
+    fn map_xy(&self, devs: &EiDeviceSet, x: f32, y: f32) -> (f32, f32) {
+        map_stream_to_region(
+            x,
+            y,
+            self.stream_w.load(Ordering::Relaxed) as f32,
+            self.stream_h.load(Ordering::Relaxed) as f32,
+            devs.abs_region,
+        )
     }
 
     fn next_seq(&self) -> u32 {
@@ -193,10 +275,11 @@ impl EiInjector {
         let Some(abs) = devs.abs_iface.as_ref() else {
             return;
         };
+        let (mx, my) = self.map_xy(&devs, x, y);
         let serial = self.conn.serial();
         let seq = self.next_seq();
         dev.device().start_emulating(serial, seq);
-        abs.motion_absolute(x, y);
+        abs.motion_absolute(mx, my);
         dev.device().frame(serial, Self::now_us());
         dev.device().stop_emulating(serial);
         let _ = self.conn.flush();
@@ -223,11 +306,12 @@ impl EiInjector {
         } else {
             ei::button::ButtonState::Released
         };
+        let (mx, my) = self.map_xy(&devs, x, y);
         let serial = self.conn.serial();
         let seq = self.next_seq();
         dev.device().start_emulating(serial, seq);
         if let Some(abs) = devs.abs_iface.as_ref() {
-            abs.motion_absolute(x, y);
+            abs.motion_absolute(mx, my);
         }
         btn.button(evdev_btn, state);
         dev.device().frame(serial, Self::now_us());
@@ -246,11 +330,12 @@ impl EiInjector {
         let Some(scroll) = devs.scroll_iface.as_ref() else {
             return;
         };
+        let (mx, my) = self.map_xy(&devs, x, y);
         let serial = self.conn.serial();
         let seq = self.next_seq();
         dev.device().start_emulating(serial, seq);
         if let Some(abs) = devs.abs_iface.as_ref() {
-            abs.motion_absolute(x, y);
+            abs.motion_absolute(mx, my);
         }
         // In egui positive delta_y is scroll UP; in libei/Wayland negative Y is scroll UP.
         let discrete = if delta_y > 0 { -120 } else { 120 };
@@ -290,13 +375,139 @@ impl EiInjector {
         dev.device().stop_emulating(serial);
         let _ = self.conn.flush();
     }
+
+    /// Establish ONE combined `org.freedesktop.portal.RemoteDesktop` +
+    /// `org.freedesktop.portal.ScreenCast` session (the flow GNOME expects):
+    /// `CreateSession` -> `SelectDevices` -> `SelectSources` -> `Start` (a single
+    /// consent dialog) -> `ConnectToEIS` (input) + `OpenPipeWireRemote` (frames).
+    ///
+    /// The returned [`PortalSession`] must be kept alive for the whole desktop
+    /// stream — dropping it closes the portal session, disconnecting EIS and
+    /// the PipeWire remote.
+    pub async fn connect_portal(
+        monitor_index: Option<u32>,
+    ) -> Result<PortalSession, String> {
+        ensure_session_env();
+        let conn = Connection::session()
+            .await
+            .map_err(|e| format!("D-Bus session error: {e}"))?;
+        let rd = Proxy::new(
+            &conn,
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.RemoteDesktop",
+        )
+        .await
+        .map_err(|e| format!("RemoteDesktop portal proxy: {e}"))?;
+        let sc = Proxy::new(
+            &conn,
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.ScreenCast",
+        )
+        .await
+        .map_err(|e| format!("ScreenCast portal proxy: {e}"))?;
+
+        let token_seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(1);
+
+        // 1. RemoteDesktop.CreateSession
+        let session_token = format!("pane_rd_sess_{token_seed}");
+        let handle1 = format!("pane_rd_cs_{token_seed}");
+        let mut opts: HashMap<&str, Variant<'_>> = HashMap::new();
+        opts.insert("handle_token", Variant::from(handle1.as_str()));
+        opts.insert("session_handle_token", Variant::from(session_token.as_str()));
+        let results = portal_call(&conn, &rd, "CreateSession", &handle1, &(opts,)).await?;
+        let session_path = session_handle_of(&results)?;
+
+        // 2. RemoteDesktop.SelectDevices — for combined sessions persistence
+        // (persist_mode/restore_token) lives ONLY here; passing it to
+        // ScreenCast.SelectSources is rejected with InvalidArgs.
+        let cached_rd_token = fs::read_to_string(rd_token_path())
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let handle2 = format!("pane_rd_sd_{token_seed}");
+        let mut sd: HashMap<&str, Variant<'_>> = HashMap::new();
+        sd.insert("handle_token", Variant::from(handle2.as_str()));
+        sd.insert("types", Variant::from(3u32)); // KEYBOARD (1) | POINTER (2)
+        sd.insert("persist_mode", Variant::from(2u32)); // persist until revoked
+        if let Some(ref tok) = cached_rd_token {
+            sd.insert("restore_token", Variant::from(tok.as_str()));
+        }
+        portal_call(&conn, &rd, "SelectDevices", &handle2, &(&session_path, sd)).await?;
+
+        // 3. ScreenCast.SelectSources — monitor + embedded cursor, no persistence.
+        let handle3 = format!("pane_rd_ss_{token_seed}");
+        if let Some(mi) = monitor_index {
+            log!("ScreenCast.SelectSources: targeting monitor index={mi} (passthrough limited by portal spec)");
+        }
+        let mut ss: HashMap<&str, Variant<'_>> = HashMap::new();
+        ss.insert("handle_token", Variant::from(handle3.as_str()));
+        ss.insert("types", Variant::from(1u32)); // MONITOR
+        ss.insert("multiple", Variant::from(false));
+        ss.insert("cursor_mode", Variant::from(2u32)); // EMBEDDED
+        portal_call(&conn, &sc, "SelectSources", &handle3, &(&session_path, ss)).await?;
+
+        // 4. RemoteDesktop.Start — the single combined consent dialog; the
+        // response carries `restore_token` AND the ScreenCast `streams`.
+        let handle4 = format!("pane_rd_st_{token_seed}");
+        let mut st: HashMap<&str, Variant<'_>> = HashMap::new();
+        st.insert("handle_token", Variant::from(handle4.as_str()));
+        let start_res = portal_call(&conn, &rd, "Start", &handle4, &(&session_path, "", st)).await?;
+        if let Some(tok_val) = start_res.get("restore_token")
+            && let Ok(tok) = tok_val.downcast_ref::<String>()
+            && !tok.is_empty()
+        {
+            save_token(rd_token_path(), &tok);
+        }
+        let (node_id, width, height, mapping_id) = stream_from_results(&start_res)?;
+
+        // 5. RemoteDesktop.ConnectToEIS -> libei sender fd for input injection.
+        let empty: HashMap<&str, Variant<'_>> = HashMap::new();
+        let reply = rd
+            .call_method("ConnectToEIS", &(&session_path, empty))
+            .await
+            .map_err(|e| format!("ConnectToEIS: {e}"))?;
+        let eis_zfd: zbus::OwnedFd = reply.body().deserialize().map_err(|e| format!("decode EIS fd: {e}"))?;
+        let injector =
+            Self::from_fd_with_stream(OwnedFd::from(eis_zfd), Some((width as u32, height as u32)), mapping_id)?;
+
+        // 6. ScreenCast.OpenPipeWireRemote -> authorized PipeWire fd for capture.
+        let empty: HashMap<&str, Variant<'_>> = HashMap::new();
+        let reply = sc
+            .call_method("OpenPipeWireRemote", &(&session_path, empty))
+            .await
+            .map_err(|e| format!("OpenPipeWireRemote: {e}"))?;
+        let pw_zfd: zbus::OwnedFd = reply.body().deserialize().map_err(|e| format!("decode PipeWire fd: {e}"))?;
+
+        log!("combined RemoteDesktop+ScreenCast session started (node {node_id}, {width}x{height})");
+        Ok(PortalSession {
+            injector,
+            node_id,
+            width,
+            height,
+            pw_fd: OwnedFd::from(pw_zfd),
+            _conn: conn,
+            _session: session_path,
+        })
+    }
 }
 
-fn register_device(devices: &Arc<Mutex<EiDeviceSet>>, dev: &Device) {
+fn register_device(devices: &Arc<Mutex<EiDeviceSet>>, dev: &Device, map_id: Option<&str>) {
     let Ok(mut set) = devices.lock() else { return };
     if let Some(abs) = dev.interface::<ei::PointerAbsolute>() {
         set.abs_dev = Some(dev.clone());
         set.abs_iface = Some(abs);
+        // Pair the ScreenCast stream with its `ei_region` when the compositor
+        // advertises `mapping_id`s; fall back to the sole region if unambiguous.
+        let regions = dev.regions();
+        let chosen = map_id
+            .and_then(|id| regions.iter().find(|r| r.mapping_id.as_deref() == Some(id)))
+            .or_else(|| if regions.len() == 1 { regions.first() } else { None });
+        set.abs_region = chosen.map(|r| (r.x as f32, r.y as f32, r.width as f32, r.height as f32));
     }
     if let Some(btn) = dev.interface::<ei::Button>() {
         set.pointer_dev = Some(dev.clone());
@@ -317,6 +528,7 @@ fn unregister_device(devices: &Arc<Mutex<EiDeviceSet>>, dev: &Device) {
     if set.abs_dev.as_ref() == Some(dev) {
         set.abs_dev = None;
         set.abs_iface = None;
+        set.abs_region = None;
     }
     if set.pointer_dev.as_ref() == Some(dev) {
         set.pointer_dev = None;
@@ -326,6 +538,26 @@ fn unregister_device(devices: &Arc<Mutex<EiDeviceSet>>, dev: &Device) {
     if set.kbd_dev.as_ref() == Some(dev) {
         set.kbd_dev = None;
         set.kbd_iface = None;
+    }
+}
+
+/// Map a point from ScreenCast stream frame coordinates (`0..stream_w`,
+/// `0..stream_h`, the coordinate space `pane-client` reports pointer events in)
+/// into the absolute `ei_region` coordinate space the compositor expects.
+/// Falls back to identity when the stream size or device region is unknown
+/// (single-monitor layouts with a zero-offset region are equivalent either way).
+pub fn map_stream_to_region(
+    x: f32,
+    y: f32,
+    stream_w: f32,
+    stream_h: f32,
+    region: Option<(f32, f32, f32, f32)>,
+) -> (f32, f32) {
+    match region {
+        Some((rx, ry, rw, rh)) if stream_w > 0.0 && stream_h > 0.0 => {
+            (rx + x * rw / stream_w, ry + y * rh / stream_h)
+        }
+        _ => (x, y),
     }
 }
 
@@ -349,9 +581,85 @@ impl WaylandDesktopStream {
     }
 }
 
-/// Start a Wayland `org.freedesktop.portal.ScreenCast` + `gst-launch-1.0`
-/// PipeWire desktop stream on a background thread.
-pub fn spawn_desktop_stream(req_id: u64, outbox: Outbox) -> WaylandDesktopStream {
+/// A started combined `RemoteDesktop` + `ScreenCast` portal session: holds the
+/// input injector, the capture stream description, and keeps the underlying
+/// D-Bus connection alive (dropping it closes the portal session).
+pub struct PortalSession {
+    pub injector: EiInjector,
+    pub node_id: u32,
+    pub width: u16,
+    pub height: u16,
+    pub pw_fd: OwnedFd,
+    _conn: Connection,
+    _session: OwnedObjectPath,
+}
+
+/// Extract the session object path from a portal `CreateSession` Response.
+fn session_handle_of(results: &HashMap<String, OwnedVariant>) -> Result<OwnedObjectPath, String> {
+    let val = results.get("session_handle").ok_or("CreateSession missing session_handle")?;
+    let s = val
+        .downcast_ref::<zbus::ObjectPath<'_>>()
+        .map(|p| p.to_string())
+        .or_else(|_| val.downcast_ref::<String>())
+        .map_err(|e| format!("invalid session_handle: {e}"))?;
+    OwnedObjectPath::try_from(s).map_err(|e| format!("session path: {e}"))
+}
+
+/// Extract `(node_id, width, height, mapping_id)` from a Start Response's
+/// `streams` array (shared by the plain ScreenCast and combined RemoteDesktop
+/// Start paths).
+fn stream_from_results(
+    results: &HashMap<String, OwnedVariant>,
+) -> Result<(u32, u16, u16, Option<String>), String> {
+    let streams_val = results.get("streams").ok_or("Start returned no streams")?;
+    let streams_arr = streams_val
+        .downcast_ref::<zbus::wire::Array<'_>>()
+        .map_err(|e| format!("decode streams array: {e}"))?;
+    let first_stream = streams_arr.first().ok_or("Start returned empty stream list")?;
+    let stream_struct = first_stream
+        .downcast_ref::<zbus::wire::Structure<'_>>()
+        .map_err(|e| format!("decode stream tuple: {e}"))?;
+    let fields = stream_struct.fields();
+    let node_id: u32 = fields
+        .first()
+        .ok_or("stream missing node_id")?
+        .downcast_ref::<u32>()
+        .map_err(|e| format!("decode node_id: {e}"))?;
+    let (width, height, mapping_id) = fields
+        .get(1)
+        .and_then(|v| v.downcast_ref::<zbus::wire::Dict<'_, '_>>().ok())
+        .and_then(|dict| {
+            let size = dict.get::<&str, Variant<'_>>(&"size").ok().flatten()?;
+            let (w, h) = size.downcast_ref::<(i32, i32)>().ok()?;
+            let map_id = dict
+                .get::<&str, Variant<'_>>(&"mapping_id")
+                .ok()
+                .flatten()
+                .and_then(|v| v.downcast_ref::<String>().ok());
+            Some(((w.max(1)) as u16, (h.max(1)) as u16, map_id))
+        })
+        .unwrap_or((1680, 1050, None));
+    Ok((node_id, width, height, mapping_id))
+}
+
+/// Cached `RemoteDesktop` restore token (single-use; refreshed on every Start).
+fn rd_token_path() -> PathBuf {
+    crate::files::home_dir().join(".cache/pane/remotedesktop.token")
+}
+
+/// Persist a portal restore token under `~/.cache/pane/` (best effort).
+fn save_token(path: PathBuf, token: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, token);
+}
+
+/// Start a Wayland full-desktop stream on a background thread: frames come from
+/// `ScreenCast` + PipeWire; when no direct KWin EIS connection is already active,
+/// a combined `RemoteDesktop` + `ScreenCast` session is established first so the
+/// returned EIS injector lands in the shared `ei` slot (one consent dialog).
+pub fn spawn_desktop_stream(req_id: u64, outbox: Outbox, ei: SharedEi, monitor_index: Option<u32>) -> WaylandDesktopStream {
     let active = Arc::new(AtomicBool::new(true));
     let stop = Arc::new(AtomicBool::new(false));
     let active_bg = Arc::clone(&active);
@@ -361,7 +669,7 @@ pub fn spawn_desktop_stream(req_id: u64, outbox: Outbox) -> WaylandDesktopStream
         .name("wayland-screencast".into())
         .spawn(move || {
             ensure_session_env();
-            if let Err(msg) = run_screencast_loop(active_bg, stop_bg, &outbox) {
+            if let Err(msg) = run_screencast_loop(active_bg, stop_bg, &outbox, &ei, monitor_index) {
                 log!("wayland desktop stream stopped: {msg}");
                 outbox.send(HostMsg::Error { req_id: Some(req_id), message: msg });
             }
@@ -380,9 +688,64 @@ fn run_screencast_loop(
     active: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     outbox: &Outbox,
+    ei: &SharedEi,
+    monitor_index: Option<u32>,
 ) -> Result<(), String> {
-    let (node_id, width, height, pw_fd) = zbus::block_on(open_portal_screencast())?;
+    // KWin direct EIS (KDE) is connected up-front by `gui_bridge`, so a plain
+    // ScreenCast session only provides frames. Otherwise establish ONE combined
+    // RemoteDesktop + ScreenCast session: GNOME then shows a single consent
+    // dialog and both the EIS injector and the PipeWire remote come from it.
+    let have_ei = lock_ei(ei).as_ref().is_some_and(EiInjector::is_alive);
 
+    let mut installed_ei = false;
+    // Keeps the portal session's D-Bus connection alive for the whole stream;
+    // dropping it closes the session (disconnecting EIS and PipeWire).
+    let mut session_keepalive: Option<(Connection, OwnedObjectPath)> = None;
+
+    let (node_id, width, height, pw_fd) = if have_ei {
+        zbus::block_on(open_portal_screencast(monitor_index))?
+    } else {
+        log!("requesting combined RemoteDesktop + ScreenCast session (one consent dialog)");
+        match zbus::block_on(EiInjector::connect_portal(monitor_index)) {
+            Ok(ps) => {
+                let PortalSession { injector, node_id, width, height, pw_fd, _conn, _session } = ps;
+                *lock_ei(ei) = Some(injector);
+                installed_ei = true;
+                session_keepalive = Some((_conn, _session));
+                (node_id, width, height, pw_fd)
+            }
+            Err(e) => {
+                log!("combined RemoteDesktop + ScreenCast session failed ({e}); falling back to ScreenCast-only capture");
+                zbus::block_on(open_portal_screencast(monitor_index))?
+            }
+        }
+    };
+
+    // Frame coordinates reported by the client are stream-frame sized; teach
+    // the injector the size (needed for the KWin path, where EIS connects before
+    // any stream exists). Harmless elsewhere — same values, set twice at most.
+    if let Some(inj) = lock_ei(ei).as_ref() {
+        inj.set_stream_size(u32::from(width), u32::from(height));
+    }
+
+    let result = capture_pw_frames(node_id, width, height, pw_fd, active, stop, outbox);
+
+    if installed_ei {
+        *lock_ei(ei) = None;
+    }
+    drop(session_keepalive);
+    result
+}
+
+fn capture_pw_frames(
+    node_id: u32,
+    width: u16,
+    height: u16,
+    pw_fd: OwnedFd,
+    active: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    outbox: &Outbox,
+) -> Result<(), String> {
     log!("starting PipeWire Wayland desktop capture: node={node_id} ({width}x{height})");
 
     let raw_pw_fd = pw_fd.as_raw_fd();
@@ -507,7 +870,7 @@ fn read_exact_or_eof(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<()> {
 
 /// Call `org.freedesktop.portal.ScreenCast` (`CreateSession` -> `SelectSources` ->
 /// `Start` -> `OpenPipeWireRemote`), caching `restore_token` in `~/.cache/pane/`.
-async fn open_portal_screencast() -> Result<(u32, u16, u16, OwnedFd), String> {
+async fn open_portal_screencast(monitor_index: Option<u32>) -> Result<(u32, u16, u16, OwnedFd), String> {
     let conn = Connection::session().await.map_err(|e| format!("D-Bus session error: {e}"))?;
     let sc = Proxy::new(
         &conn,
@@ -531,17 +894,14 @@ async fn open_portal_screencast() -> Result<(u32, u16, u16, OwnedFd), String> {
     opts.insert("session_handle_token", Variant::from(session_token.as_str()));
 
     let results = portal_call(&conn, &sc, "CreateSession", &handle_token1, &(opts,)).await?;
-    let session_path_str = match results.get("session_handle") {
-        Some(v) => v.downcast_ref::<zbus::ObjectPath<'_>>().map(|p| p.to_string())
-            .or_else(|_| v.downcast_ref::<String>())
-            .map_err(|e| format!("invalid session_handle: {e}"))?,
-        None => return Err("ScreenCast CreateSession missing session_handle".into()),
-    };
-    let session_path = OwnedObjectPath::try_from(session_path_str).map_err(|e| format!("session path: {e}"))?;
+    let session_path = session_handle_of(&results)?;
 
     // 2. SelectSources (Monitor, embedded cursor, persist_mode = 2).
     let mut sel_opts: HashMap<&str, Variant<'_>> = HashMap::new();
     let handle_token2 = format!("pane_ss_{token_seed}");
+    if let Some(mi) = monitor_index {
+        log!("ScreenCast.SelectSources: targeting monitor index={mi} (passthrough limited by portal spec)");
+    }
     sel_opts.insert("handle_token", Variant::from(handle_token2.as_str()));
     sel_opts.insert("types", Variant::from(1u32)); // MONITOR
     sel_opts.insert("multiple", Variant::from(false));
@@ -563,40 +923,10 @@ async fn open_portal_screencast() -> Result<(u32, u16, u16, OwnedFd), String> {
         && let Ok(tok) = tok_val.downcast_ref::<String>()
         && !tok.is_empty()
     {
-        let p = token_path();
-        if let Some(parent) = p.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(p, tok);
+        save_token(token_path(), &tok);
     }
 
-    let streams_val = start_res
-        .get("streams")
-        .ok_or_else(|| "ScreenCast Start returned no streams".to_owned())?;
-    let streams_arr = streams_val
-        .downcast_ref::<zbus::wire::Array<'_>>()
-        .map_err(|e| format!("decode ScreenCast streams array: {e}"))?;
-    let first_stream = streams_arr
-        .first()
-        .ok_or_else(|| "ScreenCast Start returned empty stream list".to_owned())?;
-    let stream_struct = first_stream
-        .downcast_ref::<zbus::wire::Structure<'_>>()
-        .map_err(|e| format!("decode ScreenCast stream tuple: {e}"))?;
-    let fields = stream_struct.fields();
-    let node_id: u32 = fields
-        .first()
-        .ok_or_else(|| "ScreenCast stream missing node_id".to_owned())?
-        .downcast_ref::<u32>()
-        .map_err(|e| format!("decode ScreenCast node_id: {e}"))?;
-    let (width, height) = fields
-        .get(1)
-        .and_then(|v| v.downcast_ref::<zbus::wire::Dict<'_, '_>>().ok())
-        .and_then(|dict| {
-            let size_val = dict.get::<&str, Variant<'_>>(&"size").ok().flatten()?;
-            let (w, h) = size_val.downcast_ref::<(i32, i32)>().ok()?;
-            Some(((w.max(1)) as u16, (h.max(1)) as u16))
-        })
-        .unwrap_or((1680, 1050));
+    let (node_id, width, height, _mapping_id) = stream_from_results(&start_res)?;
 
     // 4. OpenPipeWireRemote
     let empty_opts: HashMap<&str, Variant<'_>> = HashMap::new();
@@ -814,6 +1144,115 @@ pub fn keysym_to_evdev(ks: u32) -> Option<(u32, bool)> {
     Some(pair)
 }
 
+/// Query available monitors via `xrandr --query`.  Returns connected outputs
+/// sorted left-to-right (then top-to-bottom), each with an index matching its
+/// position in the returned Vec.
+pub fn list_monitors() -> Vec<pane_proto::msg::MonitorInfo> {
+    let output = match Command::new("xrandr")
+        .args(&["--query"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Vec::new(),
+    };
+
+    // --- pass 1: find primary output name ---
+    let mut primary_name = "";
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if !trimmed.contains(" connected") || trimmed.contains("disconnected") {
+            continue;
+        }
+        if trimmed.starts_with("* ")
+            && trimmed.split_whitespace().count() > 1
+        {
+            primary_name = trimmed
+                .split_once(' ')
+                .map(|(name, _)| name.trim_matches('*'))
+                .unwrap_or("");
+        }
+    }
+
+    // --- pass 2: collect connected monitors with offset for sorting ---
+    let mut monitored: Vec<(i32, pane_proto::msg::MonitorInfo)> = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if !trimmed.contains("connected") || trimmed.contains("disconnected") {
+            continue;
+        }
+
+        // Name is the first whitespace-delimited token.
+        let name = trimmed.split_whitespace().next().unwrap_or("").trim_matches('*');
+
+        for chunk in trimmed.split_whitespace() {
+            // Skip anything that doesn't look like a resolution+offset token.
+            if !chunk.contains('x') || !chunk.contains('+') || chunk.ends_with("mm") {
+                continue;
+            }
+            let (w, h, ox) = match parse_xrandr_size(chunk) {
+                Some(v) => v,
+                None => continue,
+            };
+            monitored.push((ox, pane_proto::msg::MonitorInfo {
+                index: 0,
+                name: name.to_string(),
+                width: w as u32,
+                height: h as u32,
+                is_primary: name == primary_name,
+            }));
+        }
+    }
+
+    // Sort left-to-right (by x offset), then assign sequential indices.
+    monitored.sort_by_key(|&(ox, _)| ox);
+    let monitors: Vec<pane_proto::msg::MonitorInfo> = monitored
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, m))| {
+            let mut m = m;
+            m.index = i as u32;
+            m
+        })
+        .collect();
+
+    monitors
+}
+
+/// Parse a string like `1920x1080+0+0` into `(width, height, offset_x)`.
+fn parse_xrandr_size(s: &str) -> Option<(i32, i32, i32)> {
+    let (w_str, after_x) = s.split_once('x')?;
+    if !w_str.chars().all(|c| c.is_ascii_digit()) || w_str.is_empty() {
+        return None;
+    }
+    let w: i32 = w_str.parse().ok()?;
+
+    // After the 'x', we have "height[+offsetX[+offsetY]]".
+    // The part after 'x' should be all digits, or a sequence of digit groups
+    // separated by '+'. Validate it's not some other kind of token.
+    let parts: Vec<&str> = after_x.split('+').collect();
+    
+    let h_str = parts[0];
+    if !h_str.chars().all(|c| c.is_ascii_digit()) || h_str.is_empty() {
+        return None;
+    }
+    let h: i32 = h_str.parse().ok()?;
+
+    let ox = if parts.len() > 1 {
+        if !parts[1].chars().all(|c| c.is_ascii_digit()) {
+            return Some((w, h, 0)); // treat as height only with noise after
+        }
+        parts[1].parse().unwrap_or(0)
+    } else {
+        0
+    };
+
+    if w > 0 && h > 0 && h < 10000 {
+        Some((w, h, ox))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,5 +1279,25 @@ mod tests {
         assert_eq!(keysym_to_evdev(b'A' as u32), Some((30, true)));
         assert_eq!(keysym_to_evdev(0xff0d), Some((28, false)));
         assert_eq!(keysym_to_evdev(0xffe3), Some((29, false)));
+    }
+
+    #[test]
+    fn stream_frame_maps_into_abs_region() {
+        // Zero-offset region sized to the stream = identity (single monitor).
+        assert_eq!(
+            map_stream_to_region(100.0, 50.0, 1920.0, 1080.0, Some((0.0, 0.0, 1920.0, 1080.0))),
+            (100.0, 50.0)
+        );
+        // Second monitor at (1920, 0): same frame point lands on its region.
+        assert_eq!(
+            map_stream_to_region(100.0, 50.0, 1920.0, 1080.0, Some((1920.0, 0.0, 1920.0, 1080.0))),
+            (2020.0, 50.0)
+        );
+        // HiDPI: stream frame in physical px, region in logical px.
+        let (x, y) = map_stream_to_region(3840.0, 2160.0, 3840.0, 2160.0, Some((0.0, 0.0, 1920.0, 1080.0)));
+        assert_eq!((x, y), (1920.0, 1080.0));
+        // Unknown stream size or region falls back to identity.
+        assert_eq!(map_stream_to_region(10.0, 20.0, 0.0, 0.0, Some((5.0, 5.0, 100.0, 100.0))), (10.0, 20.0));
+        assert_eq!(map_stream_to_region(10.0, 20.0, 1920.0, 1080.0, None), (10.0, 20.0));
     }
 }

@@ -21,7 +21,7 @@ pub use frame::{
     COMPRESS_THRESHOLD, FLAG_LZ4, FrameDecoder, FrameError, HEADER_LEN, MAX_FRAME_LEN, decode_payload,
     encode_frame, read_frame, write_frame,
 };
-pub use msg::{ClientMsg, ContainerInfo, DirEntry, HostMsg, PROTOCOL_VERSION, ProcessInfo, ServiceAction, ServiceInfo};
+pub use msg::{ClientMsg, ContainerInfo, DirEntry, HostMsg, MonitorInfo, PROTOCOL_VERSION, ProcessInfo, ServiceAction, ServiceInfo};
 
 /// Size of a single file-transfer chunk sent in [`HostMsg::FileChunk`].
 pub const FILE_CHUNK_SIZE: usize = 64 * 1024;

@@ -30,7 +30,9 @@ use x11rb::protocol::xtest;
 use x11rb::rust_connection::RustConnection;
 
 use crate::outbox::Outbox;
-use crate::wayland_bridge::{self, EiInjector, WAYLAND_DESKTOP_WIN_ID, WaylandDesktopStream};
+use crate::wayland_bridge::{
+    self, EiInjector, SharedEi, WAYLAND_DESKTOP_WIN_ID, WaylandDesktopStream, lock_ei, new_shared_ei,
+};
 
 const FALLBACK_DISPLAY: &str = ":99";
 /// Coalesced damage capture cadence (~30 FPS max per active window).
@@ -41,7 +43,7 @@ const XK_SHIFT_R: u32 = 0xffe2;
 
 enum Cmd {
     Launch { req_id: u64, command: String },
-    AttachDesktop { req_id: u64 },
+    AttachDesktop { req_id: u64, monitor_index: Option<u32> },
     ResizeDesktopView { win_id: u32, width: u16, height: u16 },
     MouseMove { win_id: u32, x: i16, y: i16 },
     MouseButton { win_id: u32, button: u8, pressed: bool, x: i16, y: i16 },
@@ -71,8 +73,8 @@ impl GuiBridge {
         let _ = self.tx.send(Cmd::Launch { req_id, command });
     }
 
-    pub fn attach_desktop(&self, req_id: u64) {
-        let _ = self.tx.send(Cmd::AttachDesktop { req_id });
+    pub fn attach_desktop(&self, req_id: u64, monitor_index: Option<u32>) {
+        let _ = self.tx.send(Cmd::AttachDesktop { req_id, monitor_index });
     }
 
     pub fn resize_desktop_view(&self, win_id: u32, width: u16, height: u16) {
@@ -162,7 +164,10 @@ struct X11State {
     shift_keycode: Option<u8>,
     shift_held: bool,
     focused_win: Option<Window>,
-    ei: Option<EiInjector>,
+    /// Shared Wayland EIS injector: filled by `gui_bridge` (KWin direct EIS on
+    /// KDE) or by the screencast thread (combined RemoteDesktop portal on
+    /// GNOME) when a Live Desktop stream is established.
+    ei: SharedEi,
     wayland_stream: Option<WaylandDesktopStream>,
 }
 
@@ -213,7 +218,7 @@ fn bridge_loop(rx: Receiver<Cmd>, outbox: Outbox) {
                         outbox.send(HostMsg::Error { req_id: Some(req_id), message: msg });
                     }
                 }
-                Ok(Cmd::AttachDesktop { req_id }) => {
+                Ok(Cmd::AttachDesktop { req_id, monitor_index }) => {
                     if x11.is_none() {
                         match init_x11() {
                             Ok(st) => x11 = Some(st),
@@ -225,7 +230,7 @@ fn bridge_loop(rx: Receiver<Cmd>, outbox: Outbox) {
                         }
                     }
                     if let Some(st) = x11.as_mut()
-                        && let Err(msg) = st.attach_root_desktop(req_id, &outbox)
+                        && let Err(msg) = st.attach_root_desktop(req_id, &outbox, monitor_index)
                     {
                         outbox.send(HostMsg::Error { req_id: Some(req_id), message: msg });
                     }
@@ -439,17 +444,18 @@ fn init_x11() -> Result<X11State, String> {
     let (keymap, shift_keycode) = build_keymap(&conn);
     let _ = conn.flush();
 
-    let ei = if xvfb.is_none() && wayland_bridge::has_wayland_session() {
+    // Priority 1: KWin direct EIS (KDE Plasma, zero dialogs). On GNOME the
+    // combined RemoteDesktop portal connection is established later by the
+    // Live Desktop stream thread; XTEST remains the last-resort fallback.
+    let ei = new_shared_ei();
+    if xvfb.is_none() && wayland_bridge::has_wayland_session() {
         match EiInjector::connect_kwin() {
-            Ok(inj) => Some(inj),
+            Ok(inj) => *lock_ei(&ei) = Some(inj),
             Err(e) => {
-                log!("KWin EIS not available ({e}); will use X11 XTEST");
-                None
+                log!("KWin direct EIS not available ({e}); will use the RemoteDesktop portal on Live Desktop attach");
             }
         }
-    } else {
-        None
-    };
+    }
 
     Ok(X11State {
         conn,
@@ -538,7 +544,12 @@ fn build_keymap(conn: &RustConnection) -> (HashMap<u32, (u8, bool)>, Option<u8>)
 impl X11State {
     /// Attach an XDamage monitor to the active display's root window (on Xorg/Xvfb)
     /// or open a `ScreenCast` + PipeWire full-desktop stream on Wayland.
-    fn attach_root_desktop(&mut self, req_id: u64, outbox: &Outbox) -> Result<(), String> {
+    fn attach_root_desktop(
+        &mut self,
+        req_id: u64,
+        outbox: &Outbox,
+        monitor_index: Option<u32>,
+    ) -> Result<(), String> {
         let root = self.root;
         let geom = self
             .conn
@@ -550,7 +561,8 @@ impl X11State {
         // Probe whether the X server exposes a readable root framebuffer.
         // Rootless Xwayland (e.g. KDE Plasma Wayland / GNOME Wayland) returns
         // BadMatch on root get_image; on Wayland, stream the full compositor
-        // desktop via org.freedesktop.portal.ScreenCast + PipeWire + KWin EIS.
+        // desktop via the combined RemoteDesktop + ScreenCast portal (single
+        // consent dialog) with KWin direct EIS on KDE / portal EIS on GNOME.
         let root_readable = self
             .conn
             .get_image(ImageFormat::Z_PIXMAP, root, 0, 0, 1, 1, u32::MAX)
@@ -563,7 +575,8 @@ impl X11State {
                 if let Some(old) = self.wayland_stream.take() {
                     old.stop();
                 }
-                self.wayland_stream = Some(wayland_bridge::spawn_desktop_stream(req_id, outbox.clone()));
+                self.wayland_stream =
+                    Some(wayland_bridge::spawn_desktop_stream(req_id, outbox.clone(), self.ei.clone(), monitor_index));
                 if adopted > 0 {
                     log!("adopted {adopted} Xwayland window(s) alongside Wayland desktop stream");
                 }
@@ -908,16 +921,24 @@ impl X11State {
         }
     }
 
-    fn active_ei(&self) -> Option<&EiInjector> {
-        self.ei.as_ref().filter(|e| e.is_alive())
+    /// Run `f` against the shared Wayland EIS injector when one is connected
+    /// and alive. Returns `true` when the event was consumed (skip XTEST).
+    fn inject<F: FnOnce(&EiInjector)>(&self, f: F) -> bool {
+        let guard = lock_ei(&self.ei);
+        match guard.as_ref() {
+            Some(ei) if ei.is_alive() => {
+                f(ei);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn handle_mouse_move(&mut self, win_id: Window, x: i16, y: i16) {
         let Some((rx, ry)) = self.to_root_coords(win_id, x, y) else {
             return;
         };
-        if let Some(ei) = self.active_ei() {
-            ei.mouse_move(f32::from(rx), f32::from(ry));
+        if self.inject(|ei| ei.mouse_move(f32::from(rx), f32::from(ry))) {
             return;
         }
         let _ = xtest::fake_input(&self.conn, xproto::MOTION_NOTIFY_EVENT, 0, 0, self.root, rx, ry, 0);
@@ -931,9 +952,10 @@ impl X11State {
         if pressed {
             self.focus_window(win_id);
         }
-        if let Some(ei) = self.active_ei() {
+        if self.inject(|ei| {
             let _ = self.conn.flush();
             ei.mouse_button(button, pressed, f32::from(rx), f32::from(ry));
+        }) {
             return;
         }
         let _ = xtest::fake_input(&self.conn, xproto::MOTION_NOTIFY_EVENT, 0, 0, self.root, rx, ry, 0);
@@ -949,8 +971,7 @@ impl X11State {
         if delta_y == 0 {
             return;
         }
-        if let Some(ei) = self.active_ei() {
-            ei.scroll(delta_y, f32::from(rx), f32::from(ry));
+        if self.inject(|ei| ei.scroll(delta_y, f32::from(rx), f32::from(ry))) {
             return;
         }
         let button: u8 = if delta_y > 0 { 4 } else { 5 };
@@ -970,9 +991,10 @@ impl X11State {
         if pressed {
             self.focus_window(win_id);
         }
-        if let Some(ei) = self.active_ei() {
+        if self.inject(|ei| {
             let _ = self.conn.flush();
             ei.key(keysym, pressed);
+        }) {
             return;
         }
         if keysym == XK_SHIFT_L || keysym == XK_SHIFT_R {

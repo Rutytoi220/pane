@@ -168,7 +168,13 @@ fn main() {
             ClientMsg::GuiKey { win_id, keysym, pressed } => gui.key(win_id, keysym, pressed),
             ClientMsg::CloseGuiWindow { win_id } => gui.close_window(win_id),
             ClientMsg::SetGuiWindowActive { win_id, active } => gui.set_active(win_id, active),
-            ClientMsg::AttachDesktop { req_id } => gui.attach_desktop(req_id),
+            ClientMsg::ListMonitors { req_id } => {
+                outbox.send(pane_proto::msg::HostMsg::MonitorList {
+                    req_id,
+                    monitors: wayland_bridge::list_monitors(),
+                });
+            }
+            ClientMsg::AttachDesktop { req_id, monitor_index } => gui.attach_desktop(req_id, monitor_index),
             ClientMsg::ResizeDesktopView { win_id, width, height } => gui.resize_desktop_view(win_id, width, height),
         }
     }

@@ -65,8 +65,10 @@ pub enum ClientMsg {
     CloseGuiWindow { win_id: u32 },
     /// Pause or resume XDamage capture (e.g. when switching virtual workspaces).
     SetGuiWindowActive { win_id: u32, active: bool },
+    /// Request the host enumerate its connected monitors (before attaching).
+    ListMonitors { req_id: u64 },
     /// Attach to the host's live X11/Xwayland root display (`:0`/`:1`, or fallback `Xvfb :99`).
-    AttachDesktop { req_id: u64 },
+    AttachDesktop { req_id: u64, monitor_index: Option<u32> },
     /// Notify the host of the client's desktop viewport size hint.
     ResizeDesktopView { win_id: u32, width: u16, height: u16 },
 }
@@ -145,6 +147,8 @@ pub enum HostMsg {
     /// Reply to [`ClientMsg::ControlService`] or [`ClientMsg::ControlContainer`].
     ControlResult { req_id: u64, target: String, ok: bool, message: String },
 
+    /// Available monitors on the remote host (reply to `ListMonitors`).
+    MonitorList { req_id: u64, monitors: Vec<MonitorInfo> },
     /// A top-level GUI window was mapped on the host's headless Xvfb server.
     GuiWindowOpened { win_id: u32, title: String, width: u16, height: u16 },
     /// A streamed GUI window changed dimensions.
@@ -200,6 +204,19 @@ pub struct ContainerInfo {
     pub image: String,
     pub status: String,
     pub state: String,
+}
+
+/// Information about one connected monitor on the remote host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorInfo {
+    pub index: u32,
+    pub name: String,
+    /// Physical width in pixels (region within the virtual screen).
+    pub width: u32,
+    /// Physical height in pixels.
+    pub height: u32,
+    /// Whether this monitor holds the primary cursor / panels.
+    pub is_primary: bool,
 }
 
 /// One entry of a remote directory listing.
