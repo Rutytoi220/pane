@@ -918,27 +918,6 @@ impl PaneApp {
         }
     }
 
-    /// Send the attach request to the host and transition to "pending_attached" state. 
-    fn pending_attach_confirmed(&mut self, monitor_idx: usize) {
-        let req_id = self.alloc_aux_req_id();
-        self.pending_monitor_index = monitor_idx;
-        self.send(ClientMsg::AttachDesktop { req_id, monitor_index: Some(monitor_idx as u32) });
-        self.monitor_attached = false; 
-    }
-
-    /// Handle AttachDesktop error response and clean up picker state.
-    fn handle_attach_error(&mut self, req_id: Option<u64>) {
-        let pending_range = 100_000..self.next_aux_req_id;
-        if let Some(id) = req_id {
-            if pending_range.contains(&id) || self.monitor_picker_pending > 0 || self.pending_monitor_index != usize::MAX { 
-                self.notify("AttachDesktop failed. Falling back.".into(), theme::ACCENT_YELLOW);
-                self.monitor_picker_pending = 0;
-                self.pending_monitor_selection = None;
-                self.pending_monitor_index = usize::MAX;
-            }
-        }
-    }
-
     /// Handle AttachDesktop confirm/ack flow - transitions from picker active to pending_attach. 
     fn send_attach_confirm(&mut self, monitor_index: u32) {
         let req_id = self.alloc_aux_req_id();
@@ -947,12 +926,6 @@ impl PaneApp {
         self.monitor_attached = false;
     }
 
-    /// Handle AttachDesktop cancel - dismiss picker without attaching.
-    fn send_attach_cancel(&mut self) { 
-        self.monitor_picker_pending = 0;
-        self.pending_monitor_selection = None;
-        self.pending_monitor_index = usize::MAX;
-    }
 }
 
 impl eframe::App for PaneApp {

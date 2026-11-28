@@ -16,7 +16,6 @@ pub const TEXT_MUTED: Color32 = Color32::from_rgb(122, 138, 160);
 pub const ACCENT_CYAN: Color32 = Color32::from_rgb(56, 189, 248);
 pub const ACCENT_GREEN: Color32 = Color32::from_rgb(52, 211, 153);
 pub const ACCENT_AMBER: Color32 = Color32::from_rgb(251, 191, 36);
-pub const ACCENT_YELLOW: Color32 = Color32::from_rgb(250, 204, 21);
 pub const ACCENT_CORAL: Color32 = Color32::from_rgb(248, 113, 113);
 pub const ACCENT_VIOLET: Color32 = Color32::from_rgb(167, 139, 250);
 
